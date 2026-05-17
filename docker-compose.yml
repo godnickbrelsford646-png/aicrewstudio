@@ -1,0 +1,41 @@
+# Compose file for the production-target stack.
+#
+# IMPORTANT: this MVP build runs without containers (stdlib only). Compose is
+# kept here so that when the upgrade to FastAPI + Postgres + pgvector + Redis
+# happens, the same file works without changes. Use `make api` / `make demo`
+# in this build; reach for compose once production deps are installed.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: aicrew
+      POSTGRES_USER: aicrew
+      POSTGRES_PASSWORD: aicrew
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aicrew"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: aicrew
+      MINIO_ROOT_PASSWORD: aicrew-minio
+    command: server /data --console-address ":9001"
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["miniodata:/data"]
+
+volumes:
+  pgdata: {}
+  miniodata: {}
