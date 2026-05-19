@@ -181,10 +181,20 @@ class PipelineRunner:
         prid = pipeline_run_id or self._start_pipeline_run(project_id, "articles")
         article_ids: list[str] = []
         for topic in top_topics:
+            # Step 1: write article TEXT for each language (no images yet).
+            written: list[tuple[str, str, dict[str, Any]]] = []  # (article_id, lang, article_out)
             for lang in languages:
-                article_id = self._write_article(project, agents, topic, lang, prid)
-                if article_id:
+                pair = self._write_article_text(project, agents, topic, lang, prid)
+                if pair:
+                    article_id, article_out = pair
+                    written.append((article_id, lang, article_out))
                     article_ids.append(article_id)
+            # Step 2: generate ONE image for the whole topic and link the same
+            # chosen_image_id to all language versions. Saves Wan calls (was
+            # 1 image × N languages × M variants per article = N*M; now M total
+            # — typically 1 image per topic for both RU and EN).
+            if written:
+                self._generate_topic_image(project, agents, topic, written, prid)
             with db.connect(self.settings.db_path) as conn:
                 conn.execute(
                     "UPDATE topics SET status='written' WHERE id=? AND status='ranked'",
@@ -198,14 +208,26 @@ class PipelineRunner:
             )
         return article_ids
 
-    def _write_article(self, project: dict[str, Any], agents: dict[tuple[str, str], dict[str, Any]],
-                       topic: dict[str, Any], lang: str, prid: str) -> str | None:
+    def _write_article_text(self, project: dict[str, Any],
+                             agents: dict[tuple[str, str], dict[str, Any]],
+                             topic: dict[str, Any], lang: str, prid: str
+                             ) -> tuple[str, dict[str, Any]] | None:
+        """Run research → article → headlines → qa_editorial for one language.
+
+        Does NOT generate any images. The article is saved with status
+        ``qa_passed`` and chosen_headline already chosen, but
+        ``chosen_image_id`` stays NULL. Image is attached later by
+        ``_generate_topic_image`` once for the whole topic (shared across
+        languages).
+
+        Returns (article_id, article_out_dict) so the caller can reuse the
+        article body / tldr / title for the per-topic image prompt step.
+        """
         topic_inputs = {
             "title": topic["title"],
             "summary_extended": topic.get("summary", ""),
             "sources": json.loads(topic.get("sources") or "[]"),
         }
-        # Researcher
         researcher = agents.get(("researcher", lang))
         if not researcher:
             return None
@@ -213,30 +235,21 @@ class PipelineRunner:
             agent=researcher, pipeline_run_id=prid, topic_id=topic["id"],
             inputs={"topic": topic_inputs, "language": lang},
         ).output
-        # ResearchValidator (rewrites in place)
         validator = agents.get(("research_validator", lang))
         if validator:
             brief = self.executor.run(
                 agent=validator, pipeline_run_id=prid, topic_id=topic["id"],
                 inputs={"research_brief": brief, "language": lang, "topic": topic_inputs},
             ).output
-        # ArticleWriter
         writer = agents.get(("article_writer", lang))
         article_out = self.executor.run(
             agent=writer, pipeline_run_id=prid, topic_id=topic["id"],
             inputs={"topic": topic_inputs, "research_validated": brief, "language": lang,
                     "project": project},
         ).output
-        # Headlines
         headline_writer = agents.get(("headline_writer", lang))
         headlines_out = self.executor.run(
             agent=headline_writer, pipeline_run_id=prid, topic_id=topic["id"],
-            inputs={"article": article_out, "language": lang},
-        ).output
-        # Image prompts + generate images
-        ipw = agents.get(("image_prompt_writer", lang))
-        prompts_out = self.executor.run(
-            agent=ipw, pipeline_run_id=prid, topic_id=topic["id"],
             inputs={"article": article_out, "language": lang},
         ).output
         article_id = db.new_id("ar_")
@@ -252,11 +265,60 @@ class PipelineRunner:
                     "drafting", db.now_iso(),
                 ),
             )
-        media_assets = []
+        # QA editorial (text-only check + headline pick + minimal edits).
+        qa_ed = agents.get(("qa_editorial", lang))
+        qa_out = self.executor.run(
+            agent=qa_ed, pipeline_run_id=prid, article_id=article_id,
+            inputs={"article": article_out, "headlines": headlines_out.get("headlines", []),
+                    "language": lang},
+        ).output
+        with db.connect(self.settings.db_path) as conn:
+            conn.execute(
+                "UPDATE articles SET chosen_headline=?, body_full=?, "
+                "qa_score=?, qa_notes=?, status='qa_passed', written_at=? WHERE id=?",
+                (
+                    qa_out.get("chosen_headline"),
+                    qa_out.get("revised_body_md") or article_out.get("body_md", ""),
+                    int(qa_out.get("score", 0)),
+                    db.jdump(qa_out.get("issues", [])),
+                    db.now_iso(), article_id,
+                ),
+            )
+        # Make the final body available to the caller (so the image prompt
+        # step sees the post-QA text, not the raw draft).
+        article_out["body_md"] = qa_out.get("revised_body_md") or article_out.get("body_md", "")
+        article_out["title_working"] = qa_out.get("chosen_headline") or article_out.get("title_working")
+        return article_id, article_out
+
+    def _generate_topic_image(self, project: dict[str, Any],
+                               agents: dict[tuple[str, str], dict[str, Any]],
+                               topic: dict[str, Any],
+                               written: list[tuple[str, str, dict[str, Any]]],
+                               prid: str) -> None:
+        """Generate ONE image per topic and attach to ALL language versions.
+
+        Uses the FIRST written article (typically the project's primary
+        language) as the source for image_prompt_writer. The resulting
+        image rows in media_assets are linked to the first article_id by
+        FK; the same chosen_image_id is then written into every
+        articles.chosen_image_id row of this topic.
+        """
+        first_article_id, first_lang, first_article_out = written[0]
+        ipw = agents.get(("image_prompt_writer", first_lang))
+        if not ipw:
+            log.warning("topic %s: no image_prompt_writer for lang=%s, skipping image",
+                        topic["id"], first_lang)
+            return
+        prompts_out = self.executor.run(
+            agent=ipw, pipeline_run_id=prid, topic_id=topic["id"],
+            inputs={"article": first_article_out, "language": first_lang},
+        ).output
+        ipw_params = json.loads(ipw["params"]) if isinstance(ipw["params"], str) else (ipw["params"] or {})
+        image_model = ipw_params.get("image_model", "mock:placeholder") or "mock:placeholder"
+        media_assets: list[dict[str, Any]] = []
         for i, p in enumerate(prompts_out.get("image_prompts", [])):
             res = generate_image(p["prompt"], settings=self.settings, idx=i,
-                                 model=ipw["params"] and json.loads(ipw["params"]).get("image_model", "mock:placeholder")
-                                 or "mock:placeholder")
+                                  model=image_model)
             asset_id = db.new_id("ma_")
             with db.connect(self.settings.db_path) as conn:
                 conn.execute(
@@ -264,45 +326,42 @@ class PipelineRunner:
                     "model, storage_url, mime, width, height, chosen, meta, created_at) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        asset_id, article_id, project["id"], "image", lang, p["prompt"],
+                        asset_id, first_article_id, project["id"], "image",
+                        # language='multi' to signal that this asset is shared
+                        # across all language versions of the topic. The UI can
+                        # treat 'multi' the same as the article's own language.
+                        "multi",
+                        p["prompt"],
                         res.model, res.storage_url, res.mime, res.width, res.height, 0,
-                        db.jdump({"index": i, "negative": p.get("negative")}),
+                        db.jdump({"index": i, "negative": p.get("negative"),
+                                   "topic_id": topic["id"]}),
                         db.now_iso(),
                     ),
                 )
             media_assets.append({"id": asset_id, "url": res.storage_url, "index": i})
-        # QA editorial
-        qa_ed = agents.get(("qa_editorial", lang))
-        qa_out = self.executor.run(
-            agent=qa_ed, pipeline_run_id=prid, article_id=article_id,
-            inputs={"article": article_out, "headlines": headlines_out.get("headlines", []),
-                    "language": lang},
-        ).output
-        # QA visual
-        qa_vi = agents.get(("qa_visual", lang))
+        if not media_assets:
+            return
+        # QA visual: pick the best of the generated variants. We use the
+        # qa_visual agent of the first language; the image is language-neutral
+        # so any qa_visual works.
+        qa_vi = agents.get(("qa_visual", first_lang))
         chosen_idx = 0
-        if media_assets:
+        if qa_vi and len(media_assets) > 1:
             visual_out = self.executor.run(
-                agent=qa_vi, pipeline_run_id=prid, article_id=article_id,
-                inputs={"article": article_out, "image_options": media_assets, "language": lang},
+                agent=qa_vi, pipeline_run_id=prid, article_id=first_article_id,
+                inputs={"article": first_article_out, "image_options": media_assets,
+                        "language": first_lang},
             ).output
             chosen_idx = max(0, min(len(media_assets) - 1, int(visual_out.get("chosen_index", 0))))
-        chosen_image_id = media_assets[chosen_idx]["id"] if media_assets else None
+        chosen_image_id = media_assets[chosen_idx]["id"]
+        # Mark chosen, and propagate the same image to ALL language versions.
         with db.connect(self.settings.db_path) as conn:
-            if chosen_image_id:
-                conn.execute("UPDATE media_assets SET chosen=1 WHERE id=?", (chosen_image_id,))
-            conn.execute(
-                "UPDATE articles SET chosen_headline=?, chosen_image_id=?, body_full=?, "
-                "qa_score=?, qa_notes=?, status='qa_passed', written_at=? WHERE id=?",
-                (
-                    qa_out.get("chosen_headline"), chosen_image_id,
-                    qa_out.get("revised_body_md") or article_out.get("body_md", ""),
-                    int(qa_out.get("score", 0)),
-                    db.jdump(qa_out.get("issues", [])),
-                    db.now_iso(), article_id,
-                ),
-            )
-        return article_id
+            conn.execute("UPDATE media_assets SET chosen=1 WHERE id=?", (chosen_image_id,))
+            for article_id, _lang, _out in written:
+                conn.execute(
+                    "UPDATE articles SET chosen_image_id=? WHERE id=?",
+                    (chosen_image_id, article_id),
+                )
 
     # ---------------- publication phase ----------------------------------
 

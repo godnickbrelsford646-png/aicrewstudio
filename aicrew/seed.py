@@ -604,10 +604,21 @@ ZADNIM_AGENT_PARAMS: dict[str, dict[str, Any]] = {
         "topics_per_run": 8,
         "send_today_date": True,
         "memory_lookback_days": 60,
+        # Live Tavily search: ищем события на сегодняшнюю дату.
+        # Шаблон рендерится в executor с теми же переменными, что и промт.
+        # Результаты подкладываются в начало промта блоком "WEB SEARCH RESULTS".
+        "search_query_template": "events that happened on {{ today_md }} in history different years",
+        "search_depth": "basic",
+        "search_max_results": 8,
     },
     "topic_validator": {
         "confirmed_topics_target": 5,
         "max_retries": 3,
+        # Валидатор тоже идёт в Tavily — проверяет, что события РЕАЛЬНО на эту дату.
+        # Кэш 24ч, так что результат шарится с topic_generator при той же query.
+        "search_query_template": "{{ today_md }} historical events fact check",
+        "search_depth": "basic",
+        "search_max_results": 5,
     },
     "topic_ranker": {
         "criteria_weights": {
@@ -616,8 +627,21 @@ ZADNIM_AGENT_PARAMS: dict[str, dict[str, Any]] = {
         },
         "top_n_to_keep": 10,
     },
-    "researcher": {"min_facts": 10},
-    "research_validator": {"strictness": "high"},
+    "researcher": {
+        "min_facts": 10,
+        # На каждую тему — свой запрос, advanced (глубокий поиск с большим контекстом).
+        # event_date добавлен в шаблон, чтобы Tavily нашёл материалы про конкретное событие.
+        "search_query_template": "{{ topic.title }} {{ topic.event_date | default('') }}",
+        "search_depth": "advanced",
+        "search_max_results": 6,
+    },
+    "research_validator": {
+        "strictness": "high",
+        # Валидатор работает с уже найденными источниками — поиск выключен.
+        "search_query_template": "",
+        "search_depth": "basic",
+        "search_max_results": 3,
+    },
     "article_writer": {
         "target_chars": 8000,
         "tone": "живой, кинематографичный, без канцелярита, с драматургией",
@@ -627,7 +651,8 @@ ZADNIM_AGENT_PARAMS: dict[str, dict[str, Any]] = {
         "styles": ["парадокс", "контраст", "цена_решения", "вопрос", "скрытая_история"],
     },
     "image_prompt_writer": {
-        "images_per_article": 2,
+        # Одна картинка на статью — экономим в 2 раза на Wan 2.7.
+        "images_per_article": 1,
         "style_preset": "cinematic_historical",
         # Wan 2.7 via 302.ai. This is an ASYNC DashScope-style API
         # (submit -> task_id -> poll -> download URL), implemented in
