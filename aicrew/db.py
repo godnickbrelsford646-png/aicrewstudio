@@ -220,6 +220,22 @@ CREATE TABLE IF NOT EXISTS posts (
     UNIQUE(article_id, channel_id)
 );
 CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status, scheduled_for);
+
+-- Search cache: short-lived (24h) cache for web_search() calls.
+-- Key is sha1(query|language|depth|max_results); results is the raw
+-- list[dict] from the search provider, JSON-encoded. Used by
+-- aicrew/tools/search.py to dedupe Tavily calls across agents and
+-- pipeline runs (events of the day move slowly; one Tavily call per
+-- query per day is enough). TAVILY_DAILY_BUDGET counts rows in this
+-- table to enforce a per-day cap.
+CREATE TABLE IF NOT EXISTS search_cache (
+    cache_key   TEXT PRIMARY KEY,
+    query       TEXT NOT NULL,
+    language    TEXT NOT NULL DEFAULT '',
+    results     TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_search_cache_created ON search_cache(created_at);
 """
 
 

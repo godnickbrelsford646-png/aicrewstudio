@@ -91,7 +91,14 @@ class PipelineRunner:
         val_runtime["params"] = json.dumps(val_params)
 
         max_retries = max(int(val_params.get("max_retries", 5) or 5), 5)
-        forbidden = self._memory_forbidden_titles(project_id)
+        # Honor topic_generator.memory_lookback_days. Default 30 days if the
+        # agent param is missing (e.g. for older DBs). Topics produced within
+        # this window — at any non-rejected status — are added to
+        # forbidden_topics so the generator never re-proposes them.
+        gen_params = json.loads(gen["params"]) if isinstance(gen["params"], str) \
+            else dict(gen["params"] or {})
+        lookback_days = int(gen_params.get("memory_lookback_days", 30) or 30)
+        forbidden = self._memory_forbidden_titles(project_id, lookback_days=lookback_days)
         confirmed: list[dict[str, Any]] = []
 
         log.info("topic phase: project=%s target=%d max_retries=%d", project_id, target, max_retries)
@@ -458,15 +465,36 @@ class PipelineRunner:
     def create_pipeline_run(self, project_id: str, kind: str = "full") -> str:
         return self._start_pipeline_run(project_id, kind)
 
-    def _memory_forbidden_titles(self, project_id: str) -> list[str]:
+    def _memory_forbidden_titles(self, project_id: str,
+                                  lookback_days: int = 30) -> list[str]:
+        """Topics already covered (or in flight) within the last N days.
+
+        Used to seed ``forbidden_topics`` in the topic_generator prompt so the
+        same story doesn't reappear when the user re-runs the pipeline within
+        the same window.
+
+        Includes ALL non-rejected statuses (``ranked``, ``written``, etc.):
+        - ``ranked`` — generator already produced this title earlier today;
+          we don't want to spend tokens regenerating it.
+        - ``written`` — article was drafted, even if not published.
+        - published — articles whose posts were published.
+
+        ``lookback_days`` defaults to 30 and can be overridden by the
+        topic_generator agent's ``memory_lookback_days`` param. Note: the
+        Tavily search cache is INDEPENDENT — same query may hit the same
+        cached results, but the topics returned by the LLM will be different
+        because forbidden_topics is in the prompt context.
+        """
+        cutoff = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(time.time() - max(1, int(lookback_days)) * 86400),
+        )
         with db.connect(self.settings.db_path) as conn:
             rows = conn.execute(
-                "SELECT t.title FROM topics t "
-                "JOIN articles a ON a.topic_id = t.id "
-                "JOIN posts p ON p.article_id = a.id AND p.status='published' "
-                "WHERE t.project_id=? GROUP BY t.id "
-                "ORDER BY MAX(p.published_at) DESC LIMIT 200",
-                (project_id,),
+                "SELECT title FROM topics "
+                "WHERE project_id=? AND created_at >= ? "
+                "ORDER BY created_at DESC LIMIT 500",
+                (project_id, cutoff),
             ).fetchall()
         return [r["title"] for r in rows]
 

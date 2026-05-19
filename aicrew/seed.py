@@ -629,7 +629,20 @@ ZADNIM_AGENT_PARAMS: dict[str, dict[str, Any]] = {
     "image_prompt_writer": {
         "images_per_article": 2,
         "style_preset": "cinematic_historical",
-        "image_model": "302ai:wan2.7-image",
+        # NOTE: Wan 2.7 via 302.ai is an ASYNC API (submit + poll task_id),
+        # which our current synchronous /v1/images/generations call does not
+        # support. Until the async polling path is implemented and verified
+        # against the user's 302.ai dashboard, we ship with OpenAI's
+        # gpt-image-1 — same /v1/images/generations format, synchronous,
+        # high quality, billed against OPENAI_API_KEY.
+        # To switch back to Wan 2.7 once async polling is wired:
+        #   - in UI: edit "Image Prompt Writer (RU/EN)" -> set
+        #     image_model = 302ai:wan2.7-image, OR
+        #   - in this seed: revert this line to "302ai:wan2.7-image".
+        # Other tested alternatives that work via the synchronous endpoint:
+        #   "openai:dall-e-3"            (older, cheaper, 1024x1024 max)
+        #   "302ai:flux-1.1-pro"         (Black Forest Labs, sync via 302.ai)
+        "image_model": "openai:gpt-image-1",
     },
     "qa_editorial": {"min_score": 75},
     "qa_visual": {},

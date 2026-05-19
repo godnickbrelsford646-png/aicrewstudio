@@ -28,18 +28,6 @@ class Settings:
     def use_mock_search(self) -> bool:
         return self.search_provider == "mock"
 
-    @property
-    def use_openai_web_search(self) -> bool:
-        """Web search via OpenAI Responses API (POST /v1/responses).
-
-        Set ``AICREW_SEARCH_PROVIDER=openai_responses`` in the environment to
-        let agents whose ``tools_enabled`` includes ``"web_search"`` actually
-        do live web search through OpenAI's first-party tool. Requires an
-        OPENAI_API_KEY and an ``openai:*`` model (the 302.ai gateway does
-        not expose /responses + web_search and will fall back silently).
-        """
-        return self.search_provider == "openai_responses"
-
 
 def load_settings() -> Settings:
     return Settings(

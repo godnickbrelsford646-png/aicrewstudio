@@ -190,7 +190,20 @@ def generate_image(prompt: str, *, settings: Settings, idx: int = 0,
 
 def _call_real_provider(prompt: str, model: str, settings: Settings
                         ) -> tuple[bytes, int, int]:
-    """Calls 302.ai or OpenAI images API depending on the model string."""
+    """Calls 302.ai or OpenAI images API depending on the model string.
+
+    Wire format used: ``POST {base_url}/images/generations`` with body
+    ``{"model": ..., "prompt": ..., "size": "1280x720", "response_format":
+    "b64_json"}`` — i.e. the OpenAI-compatible synchronous endpoint.
+
+    KNOWN LIMITATION: Wan 2.x models on 302.ai use an ASYNCHRONOUS API
+    (submit -> poll task_id), which this synchronous path does not handle.
+    If you set model="302ai:wan2.7-image" you will see a clear warning in
+    the logs and an .error.txt file next to the placeholder PNG. To use
+    Wan, the async polling path must be implemented (see TODO at the
+    bottom of this file). For now use openai:gpt-image-1 (default),
+    openai:dall-e-3, or 302ai:flux-1.1-pro — they all work synchronously.
+    """
     # Route
     if ":" in model:
         prefix, real = model.split(":", 1)
@@ -209,6 +222,18 @@ def _call_real_provider(prompt: str, model: str, settings: Settings
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is empty in environment.")
 
+    # Early warning for known-async models so the .error.txt file makes sense.
+    if "wan" in real.lower():
+        log.warning(
+            "model=%s is the Wan family which on 302.ai uses an ASYNC API "
+            "(submit + poll task_id). This synchronous call will likely "
+            "return a task_id and we do not poll it yet. The image will "
+            "fall back to the placeholder. Switch image_model to "
+            "openai:gpt-image-1 in the agent params (or in seed.py) until "
+            "the async polling path is wired up.",
+            model,
+        )
+
     # Build OpenAI-compatible /images/generations request.
     body = {
         "model": real,
@@ -222,6 +247,10 @@ def _call_real_provider(prompt: str, model: str, settings: Settings
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    log.info(
+        "image: provider=%s model=%s endpoint=%s prompt=%r",
+        prefix, real, url, prompt[:100],
+    )
     req = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"),
         headers=headers, method="POST",
@@ -233,10 +262,11 @@ def _call_real_provider(prompt: str, model: str, settings: Settings
         err_body = exc.read().decode("utf-8", errors="replace")
         log.error("image HTTP %s: %s", exc.code, err_body[:500])
         log.warning(
-            "image generation failed: HTTP %s (model=%s). "
-            "check 302.ai dashboard for credit balance and model "
-            "availability for wan2.7-image",
-            exc.code, real,
+            "image generation failed: HTTP %s (provider=%s model=%s). "
+            "Common causes: out of credits on the provider's dashboard; "
+            "model name not recognised by the provider; image_model needs "
+            "an async-polling endpoint (Wan family).",
+            exc.code, prefix, real,
         )
         raise RuntimeError(
             f"image provider returned HTTP {exc.code}: {err_body[:300]}"
@@ -247,14 +277,27 @@ def _call_real_provider(prompt: str, model: str, settings: Settings
     # Async polling is not implemented in this MVP — fall back to placeholder.
     if item.get("b64_json"):
         data = base64.b64decode(item["b64_json"])
+        log.info("image ok: provider=%s model=%s mode=b64_json bytes=%d",
+                 prefix, real, len(data))
     elif item.get("url"):
+        log.info("image ok: provider=%s model=%s mode=url url=%s",
+                 prefix, real, item["url"])
         with urllib.request.urlopen(item["url"], timeout=120) as r:
             data = r.read()
     elif item.get("task_id") or payload.get("task_id"):
-        log.warning("image API returned async task, polling not implemented; "
-                    "falling back to placeholder. payload=%s",
-                    str(payload)[:300])
-        raise RuntimeError("image provider returned async task_id (polling not implemented)")
+        tid = item.get("task_id") or payload.get("task_id")
+        log.warning(
+            "image API returned async task_id=%s (provider=%s model=%s). "
+            "Polling is not implemented for this endpoint. Falling back to "
+            "placeholder. Fix: set image_model to a synchronous model "
+            "(openai:gpt-image-1, openai:dall-e-3, 302ai:flux-1.1-pro). "
+            "raw_payload=%s",
+            tid, prefix, real, str(payload)[:300],
+        )
+        raise RuntimeError(
+            f"image provider returned async task_id={tid} (polling not implemented). "
+            f"Use a synchronous model instead — see image_gen.py docstring."
+        )
     else:
         raise RuntimeError(f"image response missing data: {payload}")
     # Best-effort PNG dimensions extraction.

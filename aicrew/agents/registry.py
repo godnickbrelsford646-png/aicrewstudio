@@ -561,7 +561,19 @@ ROLES: dict[str, AgentRoleSpec] = {
         default_temperature=0.8,
         default_max_tokens=1500,
         prompt_template=TOPIC_GENERATOR_TMPL,
-        default_params={"topics_per_run": 8, "send_today_date": True, "memory_lookback_days": 30},
+        default_params={
+            "topics_per_run": 8,
+            "send_today_date": True,
+            "memory_lookback_days": 30,
+            # Live web search (Tavily). Empty = search disabled for this agent.
+            # If set, executor renders the template against the same context as
+            # the prompt and calls web_search(). Results are prepended to the
+            # prompt as a "WEB SEARCH RESULTS" block, AND exposed in the prompt
+            # template as the {{ web_research }} list. See aicrew/tools/search.py.
+            "search_query_template": "{{ project.niche }} {{ today_md }} {{ language }}",
+            "search_depth": "basic",          # 'basic' (1 credit) or 'advanced' (2)
+            "search_max_results": 5,
+        },
         tools=("web_search",),
     ),
     "topic_validator": AgentRoleSpec(
@@ -572,7 +584,16 @@ ROLES: dict[str, AgentRoleSpec] = {
         default_temperature=0.3,
         default_max_tokens=2000,
         prompt_template=TOPIC_VALIDATOR_TMPL,
-        default_params={"confirmed_topics_target": 5, "max_retries": 3},
+        default_params={
+            "confirmed_topics_target": 5,
+            "max_retries": 3,
+            # Validator works on already-found URLs from topic_generator,
+            # so live search is OFF by default. Set search_query_template
+            # to enable extra fact-checking searches per validation pass.
+            "search_query_template": "",
+            "search_depth": "basic",
+            "search_max_results": 3,
+        },
         tools=("web_search", "fetch_url"),
     ),
     "topic_ranker": AgentRoleSpec(
@@ -599,7 +620,15 @@ ROLES: dict[str, AgentRoleSpec] = {
         default_temperature=0.4,
         default_max_tokens=2500,
         prompt_template=RESEARCHER_TMPL,
-        default_params={"min_facts": 8},
+        default_params={
+            "min_facts": 8,
+            # Researcher needs depth, so default to 'advanced' (2 credits).
+            # Per-topic search; results are cached for 24h so RU+EN of the
+            # same topic share one Tavily call.
+            "search_query_template": "{{ topic.title }} {{ topic.event_date | default('') }}",
+            "search_depth": "advanced",
+            "search_max_results": 6,
+        },
         tools=("web_search", "fetch_url"),
     ),
     "research_validator": AgentRoleSpec(
@@ -610,7 +639,13 @@ ROLES: dict[str, AgentRoleSpec] = {
         default_temperature=0.2,
         default_max_tokens=2500,
         prompt_template=RESEARCH_VALIDATOR_TMPL,
-        default_params={"strictness": "high"},
+        default_params={
+            "strictness": "high",
+            # Off by default — validates against the same brief content.
+            "search_query_template": "",
+            "search_depth": "basic",
+            "search_max_results": 3,
+        },
         tools=("web_search", "fetch_url"),
     ),
     "article_writer": AgentRoleSpec(

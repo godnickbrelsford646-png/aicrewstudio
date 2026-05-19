@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +13,9 @@ from ..llm.adapter import LLMAdapter
 from ..llm.pricing import estimate_cost
 from ..logging_setup import set_agent_run
 from ..templates import render
+from ..tools.search import web_search
+
+log = logging.getLogger("aicrew.agent_executor")
 
 
 _RU_MONTHS = (
@@ -92,23 +96,62 @@ class AgentExecutor:
             **inputs,
         }
         rendered = render(agent["prompt_template"], ctx)
-        # Decide if this agent should run with live web search via OpenAI's
-        # Responses API. Three conditions must hold:
-        #   1) the agent's tools_enabled (set in registry per role) includes
-        #      "web_search" — currently topic_generator, topic_validator,
-        #      researcher, research_validator;
-        #   2) the project / deployment opted in with
-        #      AICREW_SEARCH_PROVIDER=openai_responses;
-        #   3) the agent is routed to an openai:* model (the 302.ai gateway
-        #      doesn't expose /responses and the adapter would silently fall
-        #      back; we still pass the flag and let the adapter decide).
-        tools_enabled = db.jload(agent.get("tools_enabled"), []) \
-            if isinstance(agent.get("tools_enabled"), str) \
-            else (agent.get("tools_enabled") or [])
-        use_web_search = bool(
-            getattr(self.settings, "use_openai_web_search", False)
-            and "web_search" in (tools_enabled or [])
-        )
+        # ---- Pre-search via Tavily (or other future search providers) ----
+        # If the agent has params.search_query_template set AND the deployment
+        # is configured with AICREW_SEARCH_PROVIDER in {tavily, mock}, we run
+        # one web search BEFORE the LLM call and prepend the results to the
+        # rendered prompt. This way:
+        #   - any LLM (openai, 302.ai, mock) works the same way;
+        #   - results are stored in agent_runs.inputs as web_research, so the
+        #     UI can show what was found and what citations the article uses;
+        #   - the search_cache table dedupes calls (default 24h TTL, see
+        #     aicrew/tools/search.py).
+        # If the template is empty, no search happens.
+        web_research: list[dict[str, Any]] = []
+        web_query = ""
+        sp = getattr(self.settings, "search_provider", "mock")
+        query_tmpl = (params or {}).get("search_query_template") or ""
+        if query_tmpl and sp in ("tavily", "mock"):
+            try:
+                web_query = render(query_tmpl, ctx).strip()
+            except Exception as exc:
+                log.warning("search_query_template render failed for role=%s: %s",
+                            agent.get("role"), exc)
+                web_query = ""
+            if web_query:
+                depth = (params or {}).get("search_depth", "basic")
+                max_results = int((params or {}).get("search_max_results", 5) or 5)
+                web_research = web_search(
+                    web_query,
+                    settings=self.settings,
+                    language=language,
+                    depth=depth,
+                    max_results=max_results,
+                )
+        if web_research:
+            ctx["web_research"] = web_research
+            ctx["web_query"] = web_query
+            # Prepend a clearly delimited block so the LLM uses these as the
+            # primary, dated source. The block format is intentionally simple
+            # (numbered, with URL and snippet) so any model can quote from it.
+            block_lines = [
+                f"WEB SEARCH RESULTS for query: {web_query}",
+                f"(Use these as the primary, dated source. {len(web_research)} results.)",
+                "",
+            ]
+            for i, r in enumerate(web_research, start=1):
+                title = (r.get("title") or "").strip()
+                url = (r.get("url") or "").strip()
+                content = (r.get("content") or "").strip()
+                block_lines.append(f"[{i}] {title}")
+                if url:
+                    block_lines.append(f"URL: {url}")
+                if content:
+                    block_lines.append(content)
+                block_lines.append("")
+            block_lines.append("--- end of web search results ---")
+            block_lines.append("")
+            rendered = "\n".join(block_lines) + rendered
         started = db.now_iso()
         with db.connect(self.settings.db_path) as conn:
             conn.execute(
@@ -131,7 +174,6 @@ class AgentExecutor:
                 agent_params=params,
                 inputs=ctx,
                 language=language,
-                use_web_search=use_web_search,
             )
             cost = estimate_cost(agent["model"], resp.tokens_in, resp.tokens_out)
             output = resp.parsed
