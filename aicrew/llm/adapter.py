@@ -49,6 +49,7 @@ class LLMAdapter(Protocol):
         agent_params: dict[str, Any] | None = None,
         inputs: dict[str, Any] | None = None,
         language: str | None = None,
+        use_web_search: bool = False,
     ) -> LLMResponse: ...
 
 
@@ -112,8 +113,32 @@ class OpenAILLMAdapter:
         agent_params: dict[str, Any] | None = None,
         inputs: dict[str, Any] | None = None,
         language: str | None = None,
+        use_web_search: bool = False,
     ) -> LLMResponse:
         base_url, api_key, real_model = self._route(model)
+        # Web search is only supported via OpenAI's Responses API. The 302.ai
+        # gateway is OpenAI-compatible for /chat/completions but does NOT
+        # currently expose /v1/responses + the web_search tool. So if the
+        # caller asked for web_search but we're routed to 302.ai, we log a
+        # warning and silently fall back to plain chat/completions.
+        if use_web_search and "302.ai" in base_url:
+            log.warning(
+                "web_search requested but model is routed to 302.ai which does "
+                "not support /responses; falling back to chat/completions for "
+                "model=%s. Use openai:* prefix to enable real web search.",
+                model,
+            )
+            use_web_search = False
+        if use_web_search:
+            return self._call_responses_with_web_search(
+                base_url=base_url,
+                api_key=api_key,
+                real_model=real_model,
+                prompt=prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                language=language,
+            )
         # Language-aware system message: if a language is given, lock the
         # model to reply ONLY in that language. Otherwise fall back to the
         # generic English instruction. This is the fix for "English-channel
@@ -199,6 +224,207 @@ class OpenAILLMAdapter:
                  "base_url": base_url},
         )
 
+    def _call_responses_with_web_search(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        real_model: str,
+        prompt: str,
+        temperature: float,
+        max_tokens: int,
+        language: str | None,
+    ) -> LLMResponse:
+        """Call OpenAI Responses API (POST /v1/responses) with web_search tool.
+
+        This is used for agents that need real, current web search — primarily
+        topic_generator, topic_validator, researcher and research_validator.
+        Replaces the old Tavily/Serper integration plan: we lean on OpenAI's
+        first-party tool, so we only need one API key (OPENAI_API_KEY).
+
+        Wire format (high level)::
+
+            POST {base_url}/responses
+            {
+              "model": "gpt-4o",
+              "input": [
+                {"role":"system","content":"..."},
+                {"role":"user","content":"..."}
+              ],
+              "tools": [{"type":"web_search_preview"}],
+              "temperature": 0.7,
+              "max_output_tokens": 2000,
+              "text": {"format": {"type": "json_object"}}
+            }
+
+        Response: ``output`` is an array of items; we pick the one with
+        ``type == "message"`` and read ``content[0].text``. Citations (if
+        present) are kept in ``LLMResponse.raw["annotations"]`` for later
+        display in the UI.
+
+        Note on tool name: OpenAI uses ``web_search_preview`` for the
+        currently-available tool in the Responses API. If a future model
+        only accepts ``web_search``, we retry once with the alternate name.
+        """
+        lang_norm = (language or "").strip().lower()
+        if lang_norm == "en":
+            system_msg = (
+                "You are a research assistant with web access. Use the "
+                "web_search tool aggressively to find current, accurate "
+                "information before answering. You MUST reply in English "
+                "only, regardless of the user prompt language. Always "
+                "reply with a single valid JSON object, no markdown, no "
+                "commentary before or after the JSON. The user prompt "
+                "explains the required JSON shape."
+            )
+        elif lang_norm == "ru":
+            system_msg = (
+                "Ты — исследователь с доступом к вебу. Активно используй "
+                "инструмент web_search, чтобы находить свежую и точную "
+                "информацию до того, как отвечаешь. Отвечай ТОЛЬКО на "
+                "русском языке, независимо от языка пользовательского "
+                "промта. Всегда отвечай одним валидным JSON-объектом, без "
+                "markdown, без комментариев до или после JSON. В промте "
+                "описана требуемая форма JSON."
+            )
+        else:
+            system_msg = (
+                "You are a research assistant with web access. Use the "
+                "web_search tool aggressively. Always reply with a single "
+                "valid JSON object."
+            )
+
+        url = base_url.rstrip("/") + "/responses"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        def _build_body(tool_type: str) -> dict[str, Any]:
+            return {
+                "model": real_model,
+                "input": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt},
+                ],
+                "tools": [{"type": tool_type}],
+                "temperature": float(temperature),
+                "max_output_tokens": int(max_tokens),
+                # Force JSON output. The Responses API uses `text.format`
+                # rather than `response_format` from chat/completions.
+                "text": {"format": {"type": "json_object"}},
+            }
+
+        def _post(body: dict[str, Any]) -> tuple[bytes, int]:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            t0 = time.perf_counter()
+            with urllib.request.urlopen(req, timeout=240) as resp:
+                return resp.read(), int((time.perf_counter() - t0) * 1000)
+
+        started = time.perf_counter()
+        try:
+            raw, latency = _post(_build_body("web_search_preview"))
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read().decode("utf-8", errors="replace")
+            # Some OpenAI models accept "web_search" instead of
+            # "web_search_preview". Retry once on a 400 that mentions
+            # the unknown tool.
+            if exc.code == 400 and "web_search" in err_body:
+                log.warning(
+                    "Responses API rejected web_search_preview, retrying "
+                    "with web_search. server said: %s",
+                    err_body[:300],
+                )
+                try:
+                    raw, latency = _post(_build_body("web_search"))
+                except urllib.error.HTTPError as exc2:
+                    err2 = exc2.read().decode("utf-8", errors="replace")
+                    log.error(
+                        "Responses API HTTP %s on retry: %s",
+                        exc2.code, err2[:500],
+                    )
+                    raise RuntimeError(
+                        f"OpenAI /responses HTTP {exc2.code}: {err2[:300]}"
+                    ) from exc2
+            else:
+                log.error(
+                    "Responses API HTTP %s: %s", exc.code, err_body[:500],
+                )
+                raise RuntimeError(
+                    f"OpenAI /responses HTTP {exc.code}: {err_body[:300]}"
+                ) from exc
+        except Exception as exc:
+            log.exception("Responses API request failed")
+            raise RuntimeError(f"Responses API request failed: {exc}") from exc
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Responses API returned non-JSON: {raw[:200]!r}"
+            ) from exc
+
+        text, annotations = _extract_responses_text(payload)
+        parsed = _parse_json_loose(text)
+        usage = payload.get("usage") or {}
+        # Responses API uses input_tokens/output_tokens; chat uses
+        # prompt_tokens/completion_tokens. Normalize to chat-style names.
+        tokens_in = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+        tokens_out = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+        return LLMResponse(
+            text=text,
+            parsed=parsed,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            latency_ms=latency,
+            raw={
+                "provider": "openai-responses",
+                "model": real_model,
+                "base_url": base_url,
+                "annotations": annotations,
+                "tool_used": "web_search",
+            },
+        )
+
+
+def _extract_responses_text(payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """Pull the assistant's final text + URL citations out of a Responses payload.
+
+    The Responses API output is an ordered list of items. We want the LAST
+    item with ``type == "message"`` (skipping ``web_search_call`` items).
+    Inside the message, ``content`` is a list of blocks; we want the first
+    block of type ``output_text`` (or ``text`` for older variants) and its
+    ``annotations`` array (which contains url_citation entries).
+    """
+    items = payload.get("output") or []
+    text = ""
+    annotations: list[dict[str, Any]] = []
+    for item in reversed(items):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        for block in item.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype in ("output_text", "text"):
+                text = block.get("text") or ""
+                annotations = list(block.get("annotations") or [])
+                break
+        if text:
+            break
+    # Some SDKs surface a convenience field. Use it as a last resort.
+    if not text and isinstance(payload.get("output_text"), str):
+        text = payload["output_text"]
+    return text, annotations
+
+
 
 def _parse_json_loose(text: str) -> dict[str, Any]:
     """Try hard to extract a JSON object from the model's reply."""
@@ -271,6 +497,7 @@ class MockLLMAdapter:
         agent_params: dict[str, Any] | None = None,
         inputs: dict[str, Any] | None = None,
         language: str | None = None,
+        use_web_search: bool = False,
     ) -> LLMResponse:
         started = time.perf_counter()
         params = agent_params or {}

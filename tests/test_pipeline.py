@@ -103,3 +103,107 @@ class PublishersTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class ResponsesApiParseTest(unittest.TestCase):
+    """Tests for the Responses API output parser used by the OpenAI
+    web_search path. We do NOT make network calls — we just feed the
+    parser realistic payloads and check that text + URL citations are
+    extracted."""
+
+    def test_extract_message_text_and_annotations(self) -> None:
+        from aicrew.llm.adapter import _extract_responses_text
+
+        payload = {
+            "output": [
+                {"type": "web_search_call", "id": "ws_1"},
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": '{"topics": [{"title": "X"}]}',
+                            "annotations": [
+                                {"type": "url_citation",
+                                 "url": "https://example.com/a",
+                                 "title": "Source A"},
+                            ],
+                        }
+                    ],
+                },
+            ]
+        }
+        text, ann = _extract_responses_text(payload)
+        self.assertIn('"topics"', text)
+        self.assertEqual(len(ann), 1)
+        self.assertEqual(ann[0]["url"], "https://example.com/a")
+
+    def test_falls_back_to_output_text_field(self) -> None:
+        from aicrew.llm.adapter import _extract_responses_text
+
+        payload = {"output": [], "output_text": '{"ok": true}'}
+        text, ann = _extract_responses_text(payload)
+        self.assertEqual(text, '{"ok": true}')
+        self.assertEqual(ann, [])
+
+    def test_handles_text_block_variant(self) -> None:
+        from aicrew.llm.adapter import _extract_responses_text
+
+        payload = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "text", "text": "{}", "annotations": []},
+                    ],
+                }
+            ]
+        }
+        text, ann = _extract_responses_text(payload)
+        self.assertEqual(text, "{}")
+        self.assertEqual(ann, [])
+
+
+class WebSearchRoutingTest(unittest.TestCase):
+    """The adapter must NOT try to use /v1/responses on the 302.ai gateway
+    (it doesn't expose web_search). It should warn and fall back to
+    /v1/chat/completions silently. We can verify that without network
+    by mocking the chat path."""
+
+    def test_falls_back_when_routed_to_302ai(self) -> None:
+        from unittest import mock
+        from aicrew.llm.adapter import OpenAILLMAdapter, LLMResponse
+
+        adapter = OpenAILLMAdapter(openai_key="sk-test", ai302_key="sk-302")
+        # Patch the responses path to fail loudly if reached.
+        with mock.patch.object(
+            adapter, "_call_responses_with_web_search",
+            side_effect=AssertionError("must not be called for 302.ai"),
+        ):
+            # Patch urlopen so chat/completions doesn't actually fire.
+            fake_body = (
+                b'{"choices":[{"message":{"content":"{\\"ok\\":1}"}}],'
+                b'"usage":{"prompt_tokens":3,"completion_tokens":4}}'
+            )
+            class _Resp:
+                def read(self_inner): return fake_body
+                def __enter__(self_inner): return self_inner
+                def __exit__(self_inner, *a): return False
+            with mock.patch("urllib.request.urlopen", return_value=_Resp()):
+                resp = adapter.call(
+                    model="302ai:gpt-4o",
+                    prompt="hi",
+                    temperature=0.5,
+                    max_tokens=100,
+                    response_schema=None,
+                    agent_role="topic_generator",
+                    agent_params={},
+                    inputs={},
+                    language="ru",
+                    use_web_search=True,
+                )
+        self.assertIsInstance(resp, LLMResponse)
+        self.assertEqual(resp.parsed, {"ok": 1})
+        self.assertEqual(resp.raw["provider"], "openai-compat")

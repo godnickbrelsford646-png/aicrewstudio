@@ -92,6 +92,23 @@ class AgentExecutor:
             **inputs,
         }
         rendered = render(agent["prompt_template"], ctx)
+        # Decide if this agent should run with live web search via OpenAI's
+        # Responses API. Three conditions must hold:
+        #   1) the agent's tools_enabled (set in registry per role) includes
+        #      "web_search" — currently topic_generator, topic_validator,
+        #      researcher, research_validator;
+        #   2) the project / deployment opted in with
+        #      AICREW_SEARCH_PROVIDER=openai_responses;
+        #   3) the agent is routed to an openai:* model (the 302.ai gateway
+        #      doesn't expose /responses and the adapter would silently fall
+        #      back; we still pass the flag and let the adapter decide).
+        tools_enabled = db.jload(agent.get("tools_enabled"), []) \
+            if isinstance(agent.get("tools_enabled"), str) \
+            else (agent.get("tools_enabled") or [])
+        use_web_search = bool(
+            getattr(self.settings, "use_openai_web_search", False)
+            and "web_search" in (tools_enabled or [])
+        )
         started = db.now_iso()
         with db.connect(self.settings.db_path) as conn:
             conn.execute(
@@ -114,6 +131,7 @@ class AgentExecutor:
                 agent_params=params,
                 inputs=ctx,
                 language=language,
+                use_web_search=use_web_search,
             )
             cost = estimate_cost(agent["model"], resp.tokens_in, resp.tokens_out)
             output = resp.parsed
