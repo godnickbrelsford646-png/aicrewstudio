@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 CREATE TABLE IF NOT EXISTS projects (
     id                       TEXT PRIMARY KEY,
     user_id                  TEXT NOT NULL REFERENCES users(id),
+    slug                     TEXT NOT NULL UNIQUE DEFAULT '',
     name                     TEXT NOT NULL,
     niche                    TEXT NOT NULL DEFAULT '',
     description              TEXT NOT NULL DEFAULT '',
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS agents (
     id                TEXT PRIMARY KEY,
     project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    slug              TEXT NOT NULL DEFAULT '',
     role              TEXT NOT NULL,
     display_name      TEXT NOT NULL,
     description       TEXT NOT NULL DEFAULT '',
@@ -74,6 +76,7 @@ CREATE TABLE IF NOT EXISTS agents (
     updated_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agents_project_role ON agents(project_id, role);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_project_slug ON agents(project_id, slug);
 
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     id            TEXT PRIMARY KEY,
@@ -177,6 +180,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
 CREATE TABLE IF NOT EXISTS channels (
     id                   TEXT PRIMARY KEY,
     project_id           TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    slug                 TEXT NOT NULL DEFAULT '',
     kind                 TEXT NOT NULL,
     name                 TEXT NOT NULL,
     language             TEXT NOT NULL DEFAULT 'ru',
@@ -238,6 +242,62 @@ def connect(db_path: str) -> Iterator[sqlite3.Connection]:
 def init_schema(db_path: str) -> None:
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        # Soft migrations: add slug columns if missing (for existing DBs).
+        for table, col in (("projects", "slug"), ("agents", "slug"), ("channels", "slug")):
+            cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if col not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+
+
+# --------------------------------------------------------------------- slug --
+
+_RU2LAT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def slugify(text: str, max_len: int = 60) -> str:
+    """Russian-aware slugifier. 'Задним числом' -> 'zadnim-chislom'."""
+    out: list[str] = []
+    prev_dash = False
+    for ch in (text or "").lower().strip():
+        if ch in _RU2LAT:
+            out.append(_RU2LAT[ch])
+            prev_dash = False
+        elif ch.isalnum():
+            out.append(ch)
+            prev_dash = False
+        else:
+            if not prev_dash and out:
+                out.append("-")
+                prev_dash = True
+    s = "".join(out).strip("-")
+    return s[:max_len].strip("-") or "x"
+
+
+def unique_slug(conn, table: str, base: str, scope_col: str | None = None,
+                scope_val: str | None = None, exclude_id: str | None = None) -> str:
+    """Return a slug unique within the table (optionally scoped by another col)."""
+    candidate = base
+    n = 1
+    while True:
+        q = f"SELECT id FROM {table} WHERE slug=?"
+        args: list[Any] = [candidate]
+        if scope_col and scope_val is not None:
+            q += f" AND {scope_col}=?"
+            args.append(scope_val)
+        if exclude_id:
+            q += " AND id<>?"
+            args.append(exclude_id)
+        row = conn.execute(q, args).fetchone()
+        if not row:
+            return candidate
+        n += 1
+        candidate = f"{base}-{n}"
 
 
 def now_iso() -> str:

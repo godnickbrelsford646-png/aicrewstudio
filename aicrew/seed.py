@@ -420,13 +420,14 @@ def seed(settings: Settings) -> dict[str, str]:
             return {"user_id": user_id, "project_id": existing_proj["id"], "status": "exists"}
 
         project_id = db.new_id("p_")
+        project_slug = db.unique_slug(conn, "projects", db.slugify(DEMO_PROJECT_NAME))
         conn.execute(
-            "INSERT INTO projects (id, user_id, name, niche, description, is_enabled, "
+            "INSERT INTO projects (id, user_id, slug, name, niche, description, is_enabled, "
             "timezone, language_modes, daily_topics_target, daily_articles_target, "
             "budget_usd_month, style_guide, created_at, updated_at) VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                project_id, user_id, DEMO_PROJECT_NAME,
+                project_id, user_id, project_slug, DEMO_PROJECT_NAME,
                 "история / события дня / культура / судьбы людей",
                 "Каждый день берём сегодняшнюю дату и находим события, которые произошли "
                 "в этот день в разные годы. Превращаем их в живые, цепляющие истории "
@@ -448,26 +449,30 @@ def seed(settings: Settings) -> dict[str, str]:
             lang = entry["language"]
 
             # Use project-specific prompt if role is in ZADNIM_PROMPTS
-            # For RU agents - use ZADNIM_PROMPTS (they're in Russian)
-            # For EN agents - keep the generic English prompt from spec
             if role in ZADNIM_PROMPTS and lang in ("ru", "bi"):
                 prompt = ZADNIM_PROMPTS[role]
             else:
                 prompt = spec.prompt_template
 
-            # Model/temperature from project config
             model, temp, max_tok = ZADNIM_AGENT_CONFIG.get(
                 role, (spec.default_model, spec.default_temperature, spec.default_max_tokens)
             )
             params = ZADNIM_AGENT_PARAMS.get(role, spec.default_params)
 
+            # Slug: role-language; for global agents (bi) -- just role.
+            base_slug = role.replace("_", "-")
+            if lang in ("ru", "en"):
+                base_slug += "-" + lang
+            slug = db.unique_slug(conn, "agents", base_slug,
+                                  scope_col="project_id", scope_val=project_id)
+
             conn.execute(
-                "INSERT INTO agents (id, project_id, role, display_name, description, "
+                "INSERT INTO agents (id, project_id, slug, role, display_name, description, "
                 "model, temperature, max_tokens, top_p, prompt_template, params, tools_enabled, "
                 "language, is_enabled, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    db.new_id("ag_"), project_id, role, entry["display_name"],
+                    db.new_id("ag_"), project_id, slug, role, entry["display_name"],
                     spec.description, model, temp, max_tok, 1.0, prompt,
                     json.dumps(params), json.dumps(list(spec.tools)),
                     lang, 1, db.now_iso(), db.now_iso(),
@@ -478,11 +483,12 @@ def seed(settings: Settings) -> dict[str, str]:
         for ch in DEMO_CHANNELS:
             spec = CHANNEL_KINDS[ch["kind"]]
             channel_id = db.new_id("c_")
+            ch_slug = db.unique_slug(conn, "channels", ch["kind"] + "-" + ch["language"],
+                                     scope_col="project_id", scope_val=project_id)
             creds_enc = encrypt(json.dumps(ch.get("creds") or {}), settings.master_key)
             rewriter_id = None
 
             if not spec.is_video:
-                # Per-channel rewriter with unique prompt
                 rspec = role_spec("channel_rewriter")
                 rewriter_id = db.new_id("ag_")
                 custom_prompt = REWRITER_PROMPTS.get(ch["kind"], rspec.prompt_template)
@@ -490,13 +496,17 @@ def seed(settings: Settings) -> dict[str, str]:
                     "channel_rewriter",
                     (rspec.default_model, rspec.default_temperature, rspec.default_max_tokens),
                 )
+                rewriter_slug = db.unique_slug(
+                    conn, "agents", "rewriter-" + ch["kind"],
+                    scope_col="project_id", scope_val=project_id,
+                )
                 conn.execute(
-                    "INSERT INTO agents (id, project_id, role, display_name, description, "
+                    "INSERT INTO agents (id, project_id, slug, role, display_name, description, "
                     "model, temperature, max_tokens, top_p, prompt_template, params, "
                     "tools_enabled, language, channel_id, is_enabled, created_at, updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        rewriter_id, project_id, "channel_rewriter",
+                        rewriter_id, project_id, rewriter_slug, "channel_rewriter",
                         f"Адаптер — {ch['name']}",
                         f"Переписывает статью под формат {spec.label} ({spec.max_chars} симв.)",
                         model, temp, max_tok, 1.0, custom_prompt,
@@ -507,12 +517,12 @@ def seed(settings: Settings) -> dict[str, str]:
                 )
 
             conn.execute(
-                "INSERT INTO channels (id, project_id, kind, name, language, is_video, "
+                "INSERT INTO channels (id, project_id, slug, kind, name, language, is_video, "
                 "posts_per_day, selection_strategy, rewriter_prompt, rewriter_agent_id, "
                 "credentials_enc, is_enabled, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    channel_id, project_id, ch["kind"], ch["name"], ch["language"],
+                    channel_id, project_id, ch_slug, ch["kind"], ch["name"], ch["language"],
                     1 if spec.is_video else 0, ch["posts_per_day"], "by_rank",
                     "", rewriter_id, creds_enc, 1, db.now_iso(), db.now_iso(),
                 ),
