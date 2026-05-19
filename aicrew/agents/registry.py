@@ -735,12 +735,18 @@ def role_spec(role: str) -> AgentRoleSpec:
 
 
 # Roles that exist *per language* (one for RU, one for EN).
+# image_prompt_writer and qa_visual are LANGUAGE-NEUTRAL: image prompts are
+# written in English regardless of the article language, and image picking
+# does not depend on language. Keeping them global cuts agent count and
+# guarantees that a topic with N language versions still gets exactly one
+# image, attached to all of them.
 LANG_SCOPED_ROLES = {"researcher", "research_validator", "article_writer",
-                     "headline_writer", "image_prompt_writer",
-                     "qa_editorial", "qa_visual", "video_scenarist"}
+                     "headline_writer",
+                     "qa_editorial", "video_scenarist"}
 
 # Roles that exist project-wide (one instance regardless of language).
-GLOBAL_ROLES = {"topic_generator", "topic_validator", "topic_ranker"}
+GLOBAL_ROLES = {"topic_generator", "topic_validator", "topic_ranker",
+                "image_prompt_writer", "qa_visual"}
 
 
 def default_agents_for_project(language_modes: list[str]) -> list[dict[str, Any]]:

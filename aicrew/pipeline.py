@@ -129,6 +129,32 @@ class PipelineRunner:
             inputs={"validated_topics": confirmed},
         ).output
 
+        # Compute score_total programmatically from scores * criteria_weights.
+        # We don't trust the LLM to do the arithmetic — many models leave
+        # score_total at 0 even when scores are populated, which then breaks
+        # ordering downstream. Read weights from the ranker's params; fall
+        # back to even weights across whatever criteria the LLM produced.
+        ranker_params = json.loads(ranker["params"]) if isinstance(ranker["params"], str) \
+            else dict(ranker["params"] or {})
+        weights = ranker_params.get("criteria_weights") or {}
+        for r in rank_out.get("ranked", []) or []:
+            scores = r.get("scores") or {}
+            if not isinstance(scores, dict):
+                scores = {}
+            if weights:
+                total = sum(float(scores.get(k, 0) or 0) * float(w)
+                            for k, w in weights.items())
+            elif scores:
+                vals = [float(v or 0) for v in scores.values()]
+                total = sum(vals) / max(1, len(vals))
+            else:
+                total = 0.0
+            # If the LLM did supply a non-zero score_total AND ours is also
+            # non-zero, prefer the larger to be conservative (avoid masking
+            # genuine ranking signal). If LLM gave 0, our computed value wins.
+            llm_total = float(r.get("score_total") or 0)
+            r["score_total"] = round(max(total, llm_total), 2)
+
         # persist topics
         scored_by_title = {r["title"]: r for r in rank_out.get("ranked", [])}
         with db.connect(self.settings.db_path) as conn:
@@ -304,10 +330,14 @@ class PipelineRunner:
         articles.chosen_image_id row of this topic.
         """
         first_article_id, first_lang, first_article_out = written[0]
-        ipw = agents.get(("image_prompt_writer", first_lang))
+        # image_prompt_writer is GLOBAL_ROLES (language-neutral) — one
+        # instance per project, language='bi'. Falls back to the per-language
+        # variant for older DBs that still have language='ru'/'en' rows.
+        ipw = (agents.get(("image_prompt_writer", "bi"))
+               or agents.get(("image_prompt_writer", first_lang)))
         if not ipw:
-            log.warning("topic %s: no image_prompt_writer for lang=%s, skipping image",
-                        topic["id"], first_lang)
+            log.warning("topic %s: no image_prompt_writer agent found; "
+                        "skipping image", topic["id"])
             return
         prompts_out = self.executor.run(
             agent=ipw, pipeline_run_id=prid, topic_id=topic["id"],
@@ -341,10 +371,12 @@ class PipelineRunner:
             media_assets.append({"id": asset_id, "url": res.storage_url, "index": i})
         if not media_assets:
             return
-        # QA visual: pick the best of the generated variants. We use the
-        # qa_visual agent of the first language; the image is language-neutral
-        # so any qa_visual works.
-        qa_vi = agents.get(("qa_visual", first_lang))
+        # QA visual: pick the best of the generated variants. qa_visual is
+        # GLOBAL_ROLES (language-neutral) — one instance per project,
+        # language='bi'. Falls back to the per-language variant for older
+        # DBs.
+        qa_vi = (agents.get(("qa_visual", "bi"))
+                 or agents.get(("qa_visual", first_lang)))
         chosen_idx = 0
         if qa_vi and len(media_assets) > 1:
             visual_out = self.executor.run(

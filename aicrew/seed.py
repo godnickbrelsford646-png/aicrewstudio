@@ -286,33 +286,39 @@ ZADNIM_PROMPTS: dict[str, str] = {
     "topic_ranker": (
         "{% if language == 'ru' %}"
         "Ты — главный редактор проекта «Задним числом».\n\n"
-        "Оцени каждую тему по 5 критериям (0–10):\n"
+        "Оцени каждую тему ЦЕЛЫМИ числами 0–10 по 5 критериям:\n"
         "1. **hook** — сила первого впечатления: есть ли парадокс, контраст, загадка?\n"
         "2. **drama** — глубина конфликта: герой vs обстоятельства, ставки, цена решения.\n"
         "3. **novelty** — насколько тема неожиданна для массового читателя.\n"
         "4. **virality** — захочет ли человек пересказать это другу.\n"
         "5. **modern_link** — есть ли связь с сегодняшним днём, отзвук в современности.\n\n"
-        "Веса: hook=0.25, drama=0.25, novelty=0.2, virality=0.2, modern_link=0.1\n\n"
         "Темы:\n"
         "{% for t in validated_topics %}- {{ t.title }}: {{ t.summary_extended }}\n{% endfor %}\n\n"
+        "ВАЖНО: ставь оценки 0–10 для КАЖДОГО критерия, НЕ оставляй нули у "
+        "сильных тем. Среднее ожидаемое значение оценки — около 6–7. "
+        "Хорошая тема не должна получать 0 ни по одному критерию. "
+        "score_total можешь не считать — мы посчитаем сами по весам.\n\n"
         "Верни JSON:\n"
         '{ "ranked": [ {"title": str, "scores": {"hook":int,"drama":int,"novelty":int,'
-        '"virality":int,"modern_link":int}, "score_total": number, "rationale": str} ] }'
+        '"virality":int,"modern_link":int}, "rationale": str} ] }'
         "{% else %}"
         "IMPORTANT: Reply in English only. Do not use Russian.\n\n"
         "You are the editor-in-chief of the \"Backdated\" project.\n\n"
-        "Score each topic on 5 criteria (0–10):\n"
+        "Score each topic with INTEGERS 0–10 on 5 criteria:\n"
         "1. **hook** — strength of the first impression: paradox, contrast, mystery?\n"
         "2. **drama** — depth of conflict: hero vs circumstances, stakes, price of a decision.\n"
         "3. **novelty** — how unexpected the topic is for a casual reader.\n"
         "4. **virality** — will the reader want to retell it to a friend?\n"
         "5. **modern_link** — does it resonate with today?\n\n"
-        "Weights: hook=0.25, drama=0.25, novelty=0.2, virality=0.2, modern_link=0.1\n\n"
         "Topics:\n"
         "{% for t in validated_topics %}- {{ t.title }}: {{ t.summary_extended }}\n{% endfor %}\n\n"
+        "IMPORTANT: assign 0–10 to EVERY criterion, do NOT leave zeros on "
+        "strong topics. Expected average score per criterion is about 6–7. "
+        "A good topic should not get 0 on any criterion. score_total is "
+        "optional — we compute it ourselves from your scores and weights.\n\n"
         "Return JSON:\n"
         '{ "ranked": [ {"title": str, "scores": {"hook":int,"drama":int,"novelty":int,'
-        '"virality":int,"modern_link":int}, "score_total": number, "rationale": str} ] }'
+        '"virality":int,"modern_link":int}, "rationale": str} ] }'
         "{% endif %}"
     ),
     "researcher": (
@@ -464,32 +470,21 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "{% endif %}"
     ),
     "image_prompt_writer": (
-        "{% if language == 'ru' %}"
-        "Ты — промт-инженер для иллюстраций проекта «Задним числом».\n\n"
-        "Статья: \"{{ article.title_working }}\"\n"
-        "TL;DR: {{ article.tldr }}\n\n"
-        "Создай {{ params.images_per_article }} промтов для генерации иллюстрации.\n"
-        "Стиль: кинематографичный, драматичный, исторический.\n"
-        "Формат: 16:9.\n"
-        "Описывай СЦЕНУ, а не текст — генератор картинок не умеет рисовать буквы.\n"
-        "Промт должен содержать: объект, обстановку, освещение, настроение, эпоху.\n"
-        "Промт пиши на английском (генератор лучше понимает английский).\n\n"
-        "Верни JSON:\n"
-        '{ "image_prompts": [ {"prompt": str, "negative": str, "aspect": "16:9", "seed": null} ] }'
-        "{% else %}"
-        "IMPORTANT: Reply in English only. Do not use Russian.\n\n"
-        "You are a prompt engineer for illustrations of the \"Backdated\" project.\n\n"
+        # Language-neutral: this agent is GLOBAL_ROLES, runs once per topic.
+        # Output is always in English (image models handle English best),
+        # which makes the choice between RU/EN article moot.
+        "You are a prompt engineer for cinematic illustrations of the "
+        "\"Backdated\" project.\n\n"
         "Article: \"{{ article.title_working }}\"\n"
         "TL;DR: {{ article.tldr }}\n\n"
-        "Create {{ params.images_per_article }} prompts for image generation.\n"
-        "Style: cinematic, dramatic, historical.\n"
-        "Format: 16:9.\n"
-        "Describe a SCENE, not text — the image model cannot render letters.\n"
-        "The prompt must include: subject, setting, lighting, mood, era.\n"
-        "Write the prompt in English (the model handles English best).\n\n"
-        "Return JSON:\n"
+        "Create {{ params.images_per_article }} prompt(s) for image generation.\n"
+        "Style: cinematic, dramatic, historical, period-accurate.\n"
+        "Format: 16:9 (size 1280*720).\n"
+        "Describe a SCENE — characters, setting, lighting, mood, era. Do NOT "
+        "ask the model to render any text or letters; image models cannot "
+        "draw legible text. Write the prompt in English.\n\n"
+        "Return strictly JSON (no markdown, no commentary):\n"
         '{ "image_prompts": [ {"prompt": str, "negative": str, "aspect": "16:9", "seed": null} ] }'
-        "{% endif %}"
     ),
     "qa_editorial": (
         "{% if language == 'ru' %}"
@@ -530,18 +525,12 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "{% endif %}"
     ),
     "qa_visual": (
-        "{% if language == 'ru' %}"
-        "Выбери лучшую картинку для статьи «{{ article.title_working }}» проекта «Задним числом».\n"
-        "Критерии: драматичность, соответствие эпохе, эмоциональная сила, кинематографичность.\n\n"
-        "Варианты:\n{{ image_options }}\n\n"
-        "Верни JSON: { \"chosen_index\": int, \"rationale\": str }"
-        "{% else %}"
-        "IMPORTANT: Reply in English only. Do not use Russian.\n\n"
-        "Pick the best image for the \"Backdated\" project article \"{{ article.title_working }}\".\n"
+        # Language-neutral: this agent is GLOBAL_ROLES, runs once per topic.
+        "Pick the best image for the \"Backdated\" project article "
+        "\"{{ article.title_working }}\".\n"
         "Criteria: drama, period accuracy, emotional power, cinematic feel.\n\n"
         "Variants:\n{{ image_options }}\n\n"
         "Return JSON: { \"chosen_index\": int, \"rationale\": str }"
-        "{% endif %}"
     ),
     "video_scenarist": (
         "{% if language == 'ru' %}"
