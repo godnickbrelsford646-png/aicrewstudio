@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
 import unittest
+from unittest import mock as _mock
 
 from aicrew import db
 from aicrew.pipeline import PipelineRunner
@@ -137,7 +139,6 @@ class TavilySearchTest(unittest.TestCase):
         self.assertEqual(out, [])
 
     def test_tavily_call_then_cache_hit(self) -> None:
-        from unittest import mock as _mock
         from aicrew.tools import search as _search
 
         os.environ["AICREW_SEARCH_PROVIDER"] = "tavily"
@@ -160,7 +161,6 @@ class TavilySearchTest(unittest.TestCase):
         self.assertEqual(count, 1)
 
     def test_tavily_daily_budget_blocks_calls(self) -> None:
-        from unittest import mock as _mock
         from aicrew.tools import search as _search
 
         os.environ["AICREW_SEARCH_PROVIDER"] = "tavily"
@@ -214,6 +214,192 @@ class ForbiddenTopicsTest(unittest.TestCase):
             info["project_id"], lookback_days=30,
         )
         self.assertEqual(set(forbidden), first_titles)
+
+
+# ----------------------------------------------------------------------------
+# Wan 2.7 async path tests. We mock urllib.request.urlopen to verify the wire
+# format (URL + body), the polling loop, and the final image download.
+# ----------------------------------------------------------------------------
+
+
+def _http_response(body: bytes):
+    """Build a fake context manager returned by urlopen(...) -> response."""
+    class _Resp:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+        def read(self) -> bytes:
+            return self._payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+    return _Resp(body)
+
+
+class WanAsyncFlowTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_wan_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "wan.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "302ai"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        os.environ["AI302_API_KEY"] = "sk-302-test"
+        self.settings = load_settings()
+
+    def test_wan27_submit_poll_download(self) -> None:
+        """Verifies the full happy-path:
+         1) submit goes to /aliyun/api/v1/services/aigc/image-generation/generation
+            with input.messages[].content[].text and parameters.enable_interleave=true
+         2) poll hits /aliyun/api/v1/tasks/<task_id> and reads task_status
+         3) the final URL from output.choices[0].message.content[0].image is
+            downloaded and saved.
+        """
+        from aicrew.tools import image_gen
+
+        # 1x1 PNG (smallest valid).
+        png = bytes.fromhex(
+            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+            "890000000d49444154789c63600100000005000150fd9b520000000049454e44"
+            "ae426082"
+        )
+        submit_resp = json.dumps({
+            "request_id": "rq-1",
+            "output": {"task_id": "task-abc", "task_status": "PENDING"},
+        }).encode("utf-8")
+        # First poll is RUNNING, second is SUCCEEDED with an image URL.
+        running_resp = json.dumps({
+            "request_id": "rq-2",
+            "output": {"task_id": "task-abc", "task_status": "RUNNING"},
+        }).encode("utf-8")
+        succeeded_resp = json.dumps({
+            "request_id": "rq-3",
+            "output": {
+                "task_id": "task-abc",
+                "task_status": "SUCCEEDED",
+                "choices": [{
+                    "message": {
+                        "content": [
+                            {"image": "https://files.302.ai/wan/result-1.png"},
+                        ],
+                    },
+                }],
+            },
+        }).encode("utf-8")
+
+        seen_urls: list[str] = []
+        seen_methods: list[str] = []
+        seen_bodies: list[bytes] = []
+
+        def fake_urlopen(req, timeout=None):
+            # urlopen() accepts either a Request object or a bare URL string
+            # (for the final image download). Handle both.
+            if isinstance(req, str):
+                url, method, data = req, "GET", b""
+            else:
+                url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+                method = req.get_method()
+                data = req.data or b""
+            seen_urls.append(url)
+            seen_methods.append(method)
+            seen_bodies.append(data)
+            if "image-generation/generation" in url and method == "POST":
+                return _http_response(submit_resp)
+            if "/tasks/task-abc" in url and method == "GET":
+                # alternate between RUNNING (first call) then SUCCEEDED.
+                idx = sum(1 for u in seen_urls if "/tasks/task-abc" in u)
+                if idx == 1:
+                    return _http_response(running_resp)
+                return _http_response(succeeded_resp)
+            if url == "https://files.302.ai/wan/result-1.png":
+                return _http_response(png)
+            raise AssertionError(f"unexpected url: {url} method={method}")
+
+        # Skip the polling sleep for the test.
+        with _mock.patch.object(image_gen, "POLL_INTERVAL_SEC", 0), \
+             _mock.patch.object(image_gen, "POLL_TIMEOUT_SEC", 30), \
+             _mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = image_gen.generate_image(
+                "an astronaut riding a horse",
+                settings=self.settings, idx=0,
+                model="302ai:wan2.7-image",
+            )
+
+        # Submit URL is correct.
+        submit_url = seen_urls[0]
+        self.assertEqual(seen_methods[0], "POST")
+        self.assertTrue(
+            submit_url.endswith(
+                "/aliyun/api/v1/services/aigc/image-generation/generation"
+            ),
+            f"unexpected submit url: {submit_url}",
+        )
+        # Submit body uses messages format with text + enable_interleave=true.
+        submit_body = json.loads(seen_bodies[0].decode("utf-8"))
+        self.assertEqual(submit_body["model"], "wan2.7-image")
+        msgs = submit_body["input"]["messages"]
+        self.assertEqual(msgs[0]["role"], "user")
+        self.assertEqual(msgs[0]["content"][0]["text"],
+                         "an astronaut riding a horse")
+        self.assertTrue(submit_body["parameters"]["enable_interleave"])
+        self.assertEqual(submit_body["parameters"]["n"], 1)
+        # We polled at least twice (RUNNING then SUCCEEDED).
+        poll_count = sum(1 for u in seen_urls if "/tasks/task-abc" in u)
+        self.assertGreaterEqual(poll_count, 2)
+        # And we downloaded the image URL.
+        self.assertIn("https://files.302.ai/wan/result-1.png", seen_urls)
+        # The result file exists on disk.
+        self.assertTrue(res.storage_url.startswith("/media/"))
+        local_path = os.path.join(self.settings.media_dir,
+                                   res.storage_url.rsplit("/", 1)[-1])
+        self.assertTrue(os.path.exists(local_path))
+        self.assertGreater(os.path.getsize(local_path), 0)
+
+    def test_wan_failed_task_raises_and_writes_error_sidecar(self) -> None:
+        """If 302.ai reports task FAILED, we should fall back to placeholder
+        AND write an .error.txt sidecar with the failure message."""
+        from aicrew.tools import image_gen
+
+        submit_resp = json.dumps({
+            "request_id": "rq-1",
+            "output": {"task_id": "task-fail", "task_status": "PENDING"},
+        }).encode("utf-8")
+        failed_resp = json.dumps({
+            "request_id": "rq-2",
+            "output": {
+                "task_id": "task-fail",
+                "task_status": "FAILED",
+                "code": "InvalidParameter",
+                "message": "size out of range",
+            },
+        }).encode("utf-8")
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+            if "image-generation/generation" in url:
+                return _http_response(submit_resp)
+            if "/tasks/task-fail" in url:
+                return _http_response(failed_resp)
+            raise AssertionError(f"unexpected url: {url}")
+
+        with _mock.patch.object(image_gen, "POLL_INTERVAL_SEC", 0), \
+             _mock.patch.object(image_gen, "POLL_TIMEOUT_SEC", 30), \
+             _mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = image_gen.generate_image(
+                "test", settings=self.settings, idx=0,
+                model="302ai:wan2.7-image",
+            )
+        # Got a placeholder back, not a real image.
+        self.assertTrue(res.storage_url.startswith("/media/"))
+        # Sidecar .error.txt exists with the failure reason.
+        files = os.listdir(self.settings.media_dir)
+        err_files = [f for f in files if f.endswith(".error.txt")]
+        self.assertEqual(len(err_files), 1, f"expected one error sidecar; got {files}")
+        with open(os.path.join(self.settings.media_dir, err_files[0]),
+                  "r", encoding="utf-8") as fh:
+            err_content = fh.read()
+        self.assertIn("size out of range", err_content)
+        self.assertIn("302ai:wan2.7-image", err_content)
 
 
 if __name__ == "__main__":

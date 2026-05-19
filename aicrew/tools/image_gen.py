@@ -2,9 +2,17 @@
 
 Routing by model string:
   - ``mock:placeholder``  -> generate a coloured PNG locally (no API call).
-  - ``302ai:wan2.7-image`` (or any ``302ai:<model>``)
-        -> POST https://api.302.ai/v1/images/generations with that model.
-  - ``openai:dall-e-3`` etc. -> OpenAI native /v1/images/generations.
+  - ``302ai:wan2.7-image`` / ``302ai:wan2.6-image`` (Wan 2.6+ family) -> ASYNC path:
+        POST https://api.302.ai/aliyun/api/v1/services/aigc/image-generation/generation
+        Body uses input.messages[].content[].text (Tongyi Wanxiang format),
+        parameters.enable_interleave=true for pure text-to-image,
+        returns task_id; poll GET /aliyun/api/v1/tasks/{task_id} until SUCCEEDED.
+  - ``302ai:wanx*`` / older Wan 2.1 -> ASYNC legacy path:
+        POST https://api.302.ai/aliyun/api/v1/services/aigc/text2image/image-synthesis
+        Body uses input.prompt; same poll flow.
+  - ``302ai:flux-*`` etc. -> SYNC path:
+        POST https://api.302.ai/v1/images/generations (OpenAI-compatible).
+  - ``openai:dall-e-3`` / ``openai:gpt-image-1`` -> OpenAI native /v1/images/generations.
 
 The result is always saved as a local PNG under ``settings.media_dir`` and
 served by the API on ``/media/<file>``.
@@ -18,6 +26,7 @@ import json
 import logging
 import os
 import struct
+import time
 import urllib.error
 import urllib.request
 import zlib
@@ -26,6 +35,25 @@ from dataclasses import dataclass
 from ..settings import Settings
 
 log = logging.getLogger("aicrew.image")
+
+# Async poll settings for 302.ai Wan path.
+POLL_INTERVAL_SEC = 3
+POLL_TIMEOUT_SEC = 180
+
+# 302.ai gateway base.
+AI302_BASE = "https://api.302.ai"
+
+# Submit endpoints. We pick by model name:
+#   wan2.6+ / wan2.7 -> /aliyun/api/v1/services/aigc/image-generation/generation
+#   older wanx-*    -> /aliyun/api/v1/services/aigc/text2image/image-synthesis
+WAN_NEW_SUBMIT_PATH = "/aliyun/api/v1/services/aigc/image-generation/generation"
+WAN_LEGACY_SUBMIT_PATH = "/aliyun/api/v1/services/aigc/text2image/image-synthesis"
+
+# Poll endpoint(s). The first one is the documented form on 302.ai.
+WAN_POLL_PATHS = (
+    "/aliyun/api/v1/tasks/{task_id}",
+    "/api/v1/tasks/{task_id}",  # fallback, some 302.ai variants
+)
 
 
 @dataclass
@@ -120,16 +148,7 @@ def _placeholder_png(prompt: str, model: str, idx: int, w: int = 480, h: int = 2
 
 def generate_image(prompt: str, *, settings: Settings, idx: int = 0,
                    model: str = "mock:placeholder") -> ImageResult:
-    """Generate an image. Saves the result locally and returns a /media/<file> URL.
-
-    Provider routing happens by ``model`` prefix or by ``settings.image_provider``:
-
-    - If model starts with ``mock:`` OR ``settings.image_provider == "mock"``:
-      generate a placeholder PNG without network calls.
-    - If model starts with ``302ai:`` OR ``settings.image_provider == "302ai"``:
-      call 302.ai gateway.
-    - Otherwise: call OpenAI native images API.
-    """
+    """Generate an image. Saves the result locally and returns a /media/<file> URL."""
     os.makedirs(settings.media_dir, exist_ok=True)
     h = hashlib.sha1((prompt + str(idx) + model).encode("utf-8")).hexdigest()[:16]
     filename = f"{h}.png"
@@ -154,15 +173,12 @@ def generate_image(prompt: str, *, settings: Settings, idx: int = 0,
             log.exception("image provider failed, falling back to placeholder")
             log.warning(
                 "image generation failed: %s. "
-                "check 302.ai dashboard for credit balance and model "
-                "availability for wan2.7-image (or whichever model is configured)",
-                exc,
+                "Common causes: out of credits on 302.ai/OpenAI dashboard, "
+                "wrong model name, or a network/region block. See sidecar "
+                "%s.error.txt for details.", exc, h,
             )
             data = _placeholder_png(prompt, model, idx, error=True)
             width, height = 480, 270
-            # Drop a sibling .error.txt file so the user can see WHY the
-            # placeholder appeared without digging through the logs:
-            #   ls /opt/aicrewstudio/media/ | grep error
             try:
                 err_path = os.path.join(settings.media_dir, f"{h}.error.txt")
                 with open(err_path, "w", encoding="utf-8") as efh:
@@ -190,53 +206,44 @@ def generate_image(prompt: str, *, settings: Settings, idx: int = 0,
 
 def _call_real_provider(prompt: str, model: str, settings: Settings
                         ) -> tuple[bytes, int, int]:
-    """Calls 302.ai or OpenAI images API depending on the model string.
-
-    Wire format used: ``POST {base_url}/images/generations`` with body
-    ``{"model": ..., "prompt": ..., "size": "1280x720", "response_format":
-    "b64_json"}`` — i.e. the OpenAI-compatible synchronous endpoint.
-
-    KNOWN LIMITATION: Wan 2.x models on 302.ai use an ASYNCHRONOUS API
-    (submit -> poll task_id), which this synchronous path does not handle.
-    If you set model="302ai:wan2.7-image" you will see a clear warning in
-    the logs and an .error.txt file next to the placeholder PNG. To use
-    Wan, the async polling path must be implemented (see TODO at the
-    bottom of this file). For now use openai:gpt-image-1 (default),
-    openai:dall-e-3, or 302ai:flux-1.1-pro — they all work synchronously.
-    """
+    """Calls 302.ai or OpenAI images API depending on the model string."""
     # Route
     if ":" in model:
         prefix, real = model.split(":", 1)
     else:
         prefix, real = settings.image_provider, model
     prefix = prefix.lower()
+    real_lower = real.lower()
 
     if prefix == "302ai":
         api_key = os.environ.get("AI302_API_KEY", "")
-        base_url = "https://api.302.ai/v1"
         if not api_key:
             raise RuntimeError("AI302_API_KEY is empty in environment.")
-    else:  # openai
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        base_url = "https://api.openai.com/v1"
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is empty in environment.")
-
-    # Early warning for known-async models so the .error.txt file makes sense.
-    if "wan" in real.lower():
-        log.warning(
-            "model=%s is the Wan family which on 302.ai uses an ASYNC API "
-            "(submit + poll task_id). This synchronous call will likely "
-            "return a task_id and we do not poll it yet. The image will "
-            "fall back to the placeholder. Switch image_model to "
-            "openai:gpt-image-1 in the agent params (or in seed.py) until "
-            "the async polling path is wired up.",
-            model,
+        # Wan 2.6 / 2.7 (modern Tongyi Wanxiang) -> async messages API.
+        if real_lower.startswith("wan2.") or real_lower.startswith("wan-2.") \
+                or real_lower in ("wan2.6-image", "wan2.7-image"):
+            return _call_302ai_async_wan_messages(prompt, real, api_key)
+        # Older wanx-* (Wan 2.1) -> async legacy text2image API.
+        if real_lower.startswith("wanx") or "wanx" in real_lower:
+            return _call_302ai_async_wan_legacy(prompt, real, api_key)
+        # Sync OpenAI-compat models on 302.ai (flux, dall-e proxy, gpt-image-1 proxy).
+        return _call_openai_compat_sync(
+            prompt, real, api_key, base_url="https://api.302.ai/v1",
         )
+    # OpenAI native
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is empty in environment.")
+    return _call_openai_compat_sync(
+        prompt, real, api_key, base_url="https://api.openai.com/v1",
+    )
 
-    # Build OpenAI-compatible /images/generations request.
+
+def _call_openai_compat_sync(prompt: str, real_model: str, api_key: str,
+                              *, base_url: str) -> tuple[bytes, int, int]:
+    """Synchronous OpenAI-compatible /v1/images/generations call."""
     body = {
-        "model": real,
+        "model": real_model,
         "prompt": prompt,
         "n": 1,
         "size": "1280x720",
@@ -247,10 +254,8 @@ def _call_real_provider(prompt: str, model: str, settings: Settings
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    log.info(
-        "image: provider=%s model=%s endpoint=%s prompt=%r",
-        prefix, real, url, prompt[:100],
-    )
+    log.info("image: sync call model=%s endpoint=%s prompt=%r",
+             real_model, url, prompt[:100])
     req = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"),
         headers=headers, method="POST",
@@ -261,48 +266,252 @@ def _call_real_provider(prompt: str, model: str, settings: Settings
     except urllib.error.HTTPError as exc:
         err_body = exc.read().decode("utf-8", errors="replace")
         log.error("image HTTP %s: %s", exc.code, err_body[:500])
-        log.warning(
-            "image generation failed: HTTP %s (provider=%s model=%s). "
-            "Common causes: out of credits on the provider's dashboard; "
-            "model name not recognised by the provider; image_model needs "
-            "an async-polling endpoint (Wan family).",
-            exc.code, prefix, real,
-        )
         raise RuntimeError(
             f"image provider returned HTTP {exc.code}: {err_body[:300]}"
         ) from exc
-
     item = (payload.get("data") or [{}])[0]
-    # 302.ai may return either b64_json, an URL, or a task_id (async mode).
-    # Async polling is not implemented in this MVP — fall back to placeholder.
     if item.get("b64_json"):
         data = base64.b64decode(item["b64_json"])
-        log.info("image ok: provider=%s model=%s mode=b64_json bytes=%d",
-                 prefix, real, len(data))
+        log.info("image ok: model=%s mode=b64_json bytes=%d", real_model, len(data))
     elif item.get("url"):
-        log.info("image ok: provider=%s model=%s mode=url url=%s",
-                 prefix, real, item["url"])
+        log.info("image ok: model=%s mode=url url=%s", real_model, item["url"])
         with urllib.request.urlopen(item["url"], timeout=120) as r:
             data = r.read()
-    elif item.get("task_id") or payload.get("task_id"):
-        tid = item.get("task_id") or payload.get("task_id")
-        log.warning(
-            "image API returned async task_id=%s (provider=%s model=%s). "
-            "Polling is not implemented for this endpoint. Falling back to "
-            "placeholder. Fix: set image_model to a synchronous model "
-            "(openai:gpt-image-1, openai:dall-e-3, 302ai:flux-1.1-pro). "
-            "raw_payload=%s",
-            tid, prefix, real, str(payload)[:300],
-        )
-        raise RuntimeError(
-            f"image provider returned async task_id={tid} (polling not implemented). "
-            f"Use a synchronous model instead — see image_gen.py docstring."
-        )
     else:
         raise RuntimeError(f"image response missing data: {payload}")
-    # Best-effort PNG dimensions extraction.
     w, h = _try_png_size(data)
     return data, w or 1280, h or 720
+
+
+# ----------------------------------------------------------------------------
+# Wan 2.6 / 2.7 async path (Tongyi Wanxiang, "image-generation/generation")
+# ----------------------------------------------------------------------------
+
+# Allowed sizes for wan2.x-image (per 302.ai docs). 16:9 -> 1280*720.
+_WAN_ALLOWED_SIZES_16_9 = "1280*720"
+
+
+def _call_302ai_async_wan_messages(prompt: str, real_model: str, api_key: str
+                                    ) -> tuple[bytes, int, int]:
+    """Async path for Wan 2.6/2.7 on 302.ai using the Tongyi Wanxiang
+    "image-generation/generation" endpoint.
+
+    Wire format (302.ai docs)::
+
+        # 1. Submit:
+        POST https://api.302.ai/aliyun/api/v1/services/aigc/image-generation/generation
+        Authorization: Bearer <AI302_API_KEY>
+        Content-Type: application/json
+        {
+          "model": "wan2.7-image",
+          "input": {"messages": [
+            {"role": "user", "content": [{"text": "<prompt>"}]}
+          ]},
+          "parameters": {
+            "n": 1,
+            "size": "1280*720",
+            "enable_interleave": true,
+            "max_images": 1,
+            "watermark": false
+          }
+        }
+        -> 200 {"output": {"task_id": "...", "task_status": "PENDING"},
+                "request_id": "..."}
+
+        # 2. Poll until SUCCEEDED:
+        GET https://api.302.ai/aliyun/api/v1/tasks/<task_id>
+        Authorization: Bearer <AI302_API_KEY>
+        -> 200 {"output": {"task_status": "SUCCEEDED",
+                            "results": [{"url": "https://..."}], ...}, ...}
+
+        # 3. Download the URL.
+
+    Note on enable_interleave: for pure text-to-image (no reference image)
+    we need ``enable_interleave: true`` (the docs call this "text-image
+    interleaving output"; image array length 0 is allowed; n is fixed to 1
+    in this mode; max_images is 1..5). The default mode in the docs is
+    ``enable_interleave: false`` which is image EDITING and REQUIRES at
+    least one input image — we don't have one, so we explicitly set true.
+    """
+    submit_url = AI302_BASE + WAN_NEW_SUBMIT_PATH
+    body = {
+        "model": real_model,
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"text": prompt[:2000]}],  # 2000-char hard cap
+                }
+            ]
+        },
+        "parameters": {
+            "n": 1,
+            "size": _WAN_ALLOWED_SIZES_16_9,
+            "enable_interleave": True,
+            "max_images": 1,
+            "watermark": False,
+        },
+    }
+    task_id = _wan_submit(submit_url, body, api_key, real_model, prompt)
+    return _wan_poll_and_download(task_id, api_key, real_model)
+
+
+def _call_302ai_async_wan_legacy(prompt: str, real_model: str, api_key: str
+                                  ) -> tuple[bytes, int, int]:
+    """Legacy DashScope text2image flow (Wan 2.1 / wanx-*).
+
+    Body uses ``input.prompt`` (not messages) and goes to the older
+    ``text2image/image-synthesis`` endpoint. Polling endpoint is the same.
+    """
+    submit_url = AI302_BASE + WAN_LEGACY_SUBMIT_PATH
+    body = {
+        "model": real_model,
+        "input": {"prompt": prompt[:2000]},
+        "parameters": {"size": "1280*720", "n": 1},
+    }
+    task_id = _wan_submit(submit_url, body, api_key, real_model, prompt,
+                          extra_headers={"X-DashScope-Async": "enable"})
+    return _wan_poll_and_download(task_id, api_key, real_model)
+
+
+def _wan_submit(url: str, body: dict, api_key: str, real_model: str,
+                prompt: str, *, extra_headers: dict | None = None) -> str:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    log.info("image(wan): submit url=%s model=%s prompt=%r",
+             url, real_model, prompt[:100])
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"),
+        headers=headers, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace")
+        log.error("image(wan): submit HTTP %s body=%s", exc.code, err[:500])
+        raise RuntimeError(
+            f"Wan submit HTTP {exc.code} on {url}: {err[:300]}"
+        ) from exc
+    out = payload.get("output") or {}
+    task_id = (
+        out.get("task_id")
+        or payload.get("task_id")
+        or (payload.get("data") or {}).get("task_id")
+    )
+    if not task_id:
+        raise RuntimeError(
+            f"Wan submit returned 200 but no task_id. "
+            f"payload={str(payload)[:300]}"
+        )
+    log.info("image(wan): submit ok task_id=%s status=%s",
+             task_id, out.get("task_status") or "?")
+    return task_id
+
+
+def _wan_poll_and_download(task_id: str, api_key: str, real_model: str
+                            ) -> tuple[bytes, int, int]:
+    headers = {"Authorization": f"Bearer {api_key}"}
+    deadline = time.monotonic() + POLL_TIMEOUT_SEC
+    last_status = "UNKNOWN"
+    poll_payload: dict | None = None
+    poll_errors: list[str] = []
+    while time.monotonic() < deadline:
+        time.sleep(POLL_INTERVAL_SEC)
+        polled = False
+        for path_tmpl in WAN_POLL_PATHS:
+            poll_url = AI302_BASE + path_tmpl.format(task_id=task_id)
+            req = urllib.request.Request(poll_url, headers=headers, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    poll_payload = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                err = exc.read().decode("utf-8", errors="replace")
+                poll_errors.append(f"{path_tmpl} -> HTTP {exc.code}: {err[:150]}")
+                continue
+            except Exception as exc:
+                poll_errors.append(f"{path_tmpl} -> {exc}")
+                continue
+            polled = True
+            break
+        if not polled:
+            continue
+        out = (poll_payload or {}).get("output") or {}
+        last_status = (out.get("task_status") or out.get("status") or "UNKNOWN").upper()
+        log.info("image(wan): poll task_id=%s status=%s", task_id, last_status)
+        if last_status == "SUCCEEDED":
+            break
+        if last_status in ("FAILED", "UNKNOWN_ERROR"):
+            code = out.get("code") or ""
+            msg = out.get("message") or out.get("error") or ""
+            raise RuntimeError(
+                f"Wan task FAILED on 302.ai: code={code} message={msg} "
+                f"task_id={task_id}"
+            )
+    if last_status != "SUCCEEDED":
+        raise RuntimeError(
+            f"Wan task did not finish in {POLL_TIMEOUT_SEC}s "
+            f"(last_status={last_status}, task_id={task_id}). "
+            f"poll_errors={'; '.join(poll_errors[-3:]) if poll_errors else 'none'}"
+        )
+
+    out = (poll_payload or {}).get("output") or {}
+    image_url = _extract_wan_url(out, poll_payload or {})
+    if not image_url:
+        raise RuntimeError(
+            f"Wan task SUCCEEDED but no image URL in result: "
+            f"task_id={task_id} payload={str(poll_payload)[:300]}"
+        )
+    log.info("image(wan): downloading result url=%s task_id=%s",
+             image_url, task_id)
+    with urllib.request.urlopen(image_url, timeout=120) as r:
+        data = r.read()
+    log.info("image(wan): ok bytes=%d task_id=%s model=%s",
+             len(data), task_id, real_model)
+    w, h = _try_png_size(data)
+    return data, w or 1280, h or 720
+
+
+def _extract_wan_url(out: dict, payload: dict) -> str | None:
+    """Look for the image URL in several known result-shape variants."""
+    # Variant 1: output.results = [{"url": ...}]  (Wan 2.1 / wanx)
+    results = out.get("results")
+    if isinstance(results, list) and results:
+        first = results[0] or {}
+        if isinstance(first, dict):
+            url = first.get("url") or first.get("image_url") or first.get("output_url")
+            if url:
+                return url
+    # Variant 2: output.choices = [{"message": {"content": [{"image": "url"}]}}]
+    #            (Wan 2.6/2.7 messages format)
+    choices = out.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0] or {}
+        msg = (first or {}).get("message") or {}
+        content = msg.get("content") or []
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    url = block.get("image") or block.get("image_url") or block.get("url")
+                    if url:
+                        return url
+    # Variant 3: output.url / output.image_url at the top level.
+    url = out.get("url") or out.get("image_url")
+    if url:
+        return url
+    # Variant 4: payload.data[0].url (some 302.ai variants normalise output).
+    data = payload.get("data")
+    if isinstance(data, list) and data:
+        first = data[0] or {}
+        if isinstance(first, dict):
+            url = first.get("url") or first.get("image_url")
+            if url:
+                return url
+    return None
 
 
 def _try_png_size(data: bytes) -> tuple[int | None, int | None]:
