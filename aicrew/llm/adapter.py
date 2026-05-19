@@ -48,6 +48,7 @@ class LLMAdapter(Protocol):
         agent_role: str | None = None,
         agent_params: dict[str, Any] | None = None,
         inputs: dict[str, Any] | None = None,
+        language: str | None = None,
     ) -> LLMResponse: ...
 
 
@@ -110,23 +111,41 @@ class OpenAILLMAdapter:
         agent_role: str | None = None,
         agent_params: dict[str, Any] | None = None,
         inputs: dict[str, Any] | None = None,
+        language: str | None = None,
     ) -> LLMResponse:
         base_url, api_key, real_model = self._route(model)
-        # System message instructs the model to ALWAYS reply with a single
-        # JSON object — this matches our agent prompts that already say
-        # "Return JSON".
+        # Language-aware system message: if a language is given, lock the
+        # model to reply ONLY in that language. Otherwise fall back to the
+        # generic English instruction. This is the fix for "English-channel
+        # agents replying in Russian": GPT tends to mirror the user prompt's
+        # language unless the system message explicitly forbids it.
+        lang_norm = (language or "").strip().lower()
+        if lang_norm == "en":
+            system_msg = (
+                "You are a helpful assistant. You MUST reply in English only, "
+                "regardless of the language of the user prompt. Always reply "
+                "with a single valid JSON object, no markdown, no commentary "
+                "before or after the JSON. The user prompt explains the "
+                "required JSON shape."
+            )
+        elif lang_norm == "ru":
+            system_msg = (
+                "Ты помощник. Отвечай ТОЛЬКО на русском языке, независимо от "
+                "языка пользовательского промта. Всегда отвечай одним валидным "
+                "JSON-объектом, без markdown, без комментариев до или после "
+                "JSON. В пользовательском промте описана требуемая форма JSON."
+            )
+        else:
+            system_msg = (
+                "You are a helpful assistant. Always reply with a "
+                "single valid JSON object, no markdown, no commentary "
+                "before or after the JSON. The user prompt explains "
+                "the required JSON shape."
+            )
         body = {
             "model": real_model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful assistant. Always reply with a "
-                        "single valid JSON object, no markdown, no commentary "
-                        "before or after the JSON. The user prompt explains "
-                        "the required JSON shape."
-                    ),
-                },
+                {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt},
             ],
             "temperature": float(temperature),
@@ -251,11 +270,12 @@ class MockLLMAdapter:
         agent_role: str | None = None,
         agent_params: dict[str, Any] | None = None,
         inputs: dict[str, Any] | None = None,
+        language: str | None = None,
     ) -> LLMResponse:
         started = time.perf_counter()
         params = agent_params or {}
         ins = inputs or {}
-        lang = ins.get("language") or params.get("language") or "ru"
+        lang = language or ins.get("language") or params.get("language") or "ru"
         gen = _GENERATORS.get(agent_role or "")
         if gen is None:
             data = {"echo": prompt[:256], "note": f"no mock generator for role={agent_role}"}

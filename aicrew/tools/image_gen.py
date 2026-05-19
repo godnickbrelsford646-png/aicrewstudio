@@ -52,7 +52,9 @@ _FONT: dict[str, list[str]] = {
     "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
     "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
     "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
     "I": ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+    "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
     " ": ["00000"] * 7,
     "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
     ":": ["00000", "00100", "00000", "00000", "00000", "00100", "00000"],
@@ -100,11 +102,18 @@ def _seed_color(seed: str) -> tuple[int, int, int]:
     return (60 + h[0] % 160, 60 + h[1] % 160, 60 + h[2] % 160)
 
 
-def _placeholder_png(prompt: str, model: str, idx: int, w: int = 480, h: int = 270) -> bytes:
-    bg = _seed_color(prompt + str(idx))
+def _placeholder_png(prompt: str, model: str, idx: int, w: int = 480, h: int = 270,
+                     *, error: bool = False) -> bytes:
+    if error:
+        # Distinct reddish background so the user can SEE that this placeholder
+        # is the result of a real-API failure (vs the normal mock path).
+        bg = (180, 40, 40)
+        label = f"ERR {idx + 1}"
+    else:
+        bg = _seed_color(prompt + str(idx))
+        label = f"AI {idx + 1}"
     fg = (255, 255, 255)
     pixels = [[bg for _ in range(w)] for _ in range(h)]
-    label = f"AI {idx + 1}"
     _draw_text(pixels, label, 20, 20, fg, scale=4)
     return _png_bytes(pixels)
 
@@ -143,8 +152,30 @@ def generate_image(prompt: str, *, settings: Settings, idx: int = 0,
             data, width, height = _call_real_provider(prompt, model, settings)
         except Exception as exc:
             log.exception("image provider failed, falling back to placeholder")
-            data = _placeholder_png(prompt, model, idx)
+            log.warning(
+                "image generation failed: %s. "
+                "check 302.ai dashboard for credit balance and model "
+                "availability for wan2.7-image (or whichever model is configured)",
+                exc,
+            )
+            data = _placeholder_png(prompt, model, idx, error=True)
             width, height = 480, 270
+            # Drop a sibling .error.txt file so the user can see WHY the
+            # placeholder appeared without digging through the logs:
+            #   ls /opt/aicrewstudio/media/ | grep error
+            try:
+                err_path = os.path.join(settings.media_dir, f"{h}.error.txt")
+                with open(err_path, "w", encoding="utf-8") as efh:
+                    efh.write(
+                        f"image generation failed\n"
+                        f"model: {model}\n"
+                        f"prompt: {prompt[:500]}\n"
+                        f"error: {exc}\n"
+                        f"hint: check 302.ai dashboard for credits and "
+                        f"model availability (e.g. wan2.7-image).\n"
+                    )
+            except Exception:  # pragma: no cover - diagnostic best-effort
+                log.exception("failed to write image error sidecar file")
 
     with open(path, "wb") as fh:
         fh.write(data)
@@ -201,6 +232,12 @@ def _call_real_provider(prompt: str, model: str, settings: Settings
     except urllib.error.HTTPError as exc:
         err_body = exc.read().decode("utf-8", errors="replace")
         log.error("image HTTP %s: %s", exc.code, err_body[:500])
+        log.warning(
+            "image generation failed: HTTP %s (model=%s). "
+            "check 302.ai dashboard for credit balance and model "
+            "availability for wan2.7-image",
+            exc.code, real,
+        )
         raise RuntimeError(
             f"image provider returned HTTP {exc.code}: {err_body[:300]}"
         ) from exc

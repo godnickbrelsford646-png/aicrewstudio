@@ -113,6 +113,7 @@ class AgentExecutor:
                 agent_role=agent["role"],
                 agent_params=params,
                 inputs=ctx,
+                language=language,
             )
             cost = estimate_cost(agent["model"], resp.tokens_in, resp.tokens_out)
             output = resp.parsed
