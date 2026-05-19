@@ -384,7 +384,7 @@ ZADNIM_AGENT_PARAMS: dict[str, dict[str, Any]] = {
     "image_prompt_writer": {
         "images_per_article": 2,
         "style_preset": "cinematic_historical",
-        "image_model": "302ai:flux-pro",
+        "image_model": "302ai:wan2.7-image",
     },
     "qa_editorial": {"min_score": 75},
     "qa_visual": {},
