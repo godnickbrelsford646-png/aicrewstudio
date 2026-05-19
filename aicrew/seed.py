@@ -151,13 +151,19 @@ DEMO_CHANNELS: list[dict[str, Any]] = [
 
 # ---- Custom prompt overrides for "Задним числом" project -------------------
 # These replace the generic prompts from registry.py for this specific project.
+# All prompts are BILINGUAL via {% if language == 'ru' %} ... {% else %} ... {% endif %}
+# (мини-движок шаблонов в aicrew/templates.py поддерживает эту конструкцию).
+# Для английских каналов используется название "Backdated" вместо «Задним числом».
 
 ZADNIM_PROMPTS: dict[str, str] = {
     "topic_generator": (
-        "Ты — генератор тем для проекта «Задним числом». "
-        "Сегодняшняя дата: {{ today }}.\n\n"
+        "{% if language == 'ru' %}"
+        "Ты — генератор тем для проекта «Задним числом».\n"
+        "Сегодняшняя дата: {{ today_human }} ({{ today }}).\n\n"
+        "ВАЖНО: ищи ТОЛЬКО события, которые произошли именно {{ today_md }} "
+        "(этот день и месяц) в разные годы. Не предлагай события на другие даты.\n\n"
         "Твоя задача: найти {{ params.topics_per_run }} исторических событий, "
-        "которые произошли ИМЕННО в этот день (число и месяц) в разные годы.\n\n"
+        "произошедших именно в этот день (число и месяц) в разные годы.\n\n"
         "Критерии выбора:\n"
         "- Событие должно содержать ИСТОРИЮ: герой, конфликт, драма, поворот, тайна или абсурд.\n"
         "- Не просто факт из Википедии, а сюжет, который цепляет.\n"
@@ -176,11 +182,40 @@ ZADNIM_PROMPTS: dict[str, str] = {
         '"angle": "почему это интересно, в чём конфликт/герой/драма", '
         '"why_now": "связь с современностью или причина привлекательности", '
         '"tentative_sources": ["url1","url2"]} ] }'
+        "{% else %}"
+        "You are a topic generator for the \"Backdated\" project.\n"
+        "Today's date: {{ today_human }} ({{ today }}).\n\n"
+        "IMPORTANT: search ONLY for events that happened ON THIS EXACT DAY "
+        "({{ today_md }}, this day and month) in different years. Do NOT propose "
+        "events from any other date.\n\n"
+        "Your task: find {{ params.topics_per_run }} historical events that "
+        "happened on this day (day and month) in different years.\n\n"
+        "Selection criteria:\n"
+        "- The event must carry a STORY: hero, conflict, drama, twist, mystery or absurdity.\n"
+        "- Not just a Wikipedia fact, but a narrative that hooks.\n"
+        "- Variety: history, culture, science, sports, politics, cinema, music, crime, tech.\n"
+        "- Mass appeal: a casual reader should understand why it matters.\n"
+        "- Verifiability: reliable sources required.\n\n"
+        "NOT suitable:\n"
+        "- Dry dates with no story ('X was born', 'treaty Y signed').\n"
+        "- Hyper-local events with no human tension.\n"
+        "- Topics that cannot be turned into a living text.\n\n"
+        "Forbidden topics (already covered):\n"
+        "{% for t in forbidden_topics %}- {{ t }}\n{% endfor %}\n\n"
+        "Use web_search for events on today's date.\n\n"
+        "Return strictly JSON:\n"
+        '{ "topics": [ {"title": "short event title", '
+        '"angle": "why it is interesting, where the conflict/hero/drama lies", '
+        '"why_now": "modern echo or reason it appeals", '
+        '"tentative_sources": ["url1","url2"]} ] }'
+        "{% endif %}"
     ),
     "topic_validator": (
-        "Ты — фактчекер проекта «Задним числом».\n\n"
+        "{% if language == 'ru' %}"
+        "Ты — фактчекер проекта «Задним числом».\n"
+        "Сегодня: {{ today_human }}.\n\n"
         "Для каждой темы из списка:\n"
-        "1. Проверь, что событие ДЕЙСТВИТЕЛЬНО произошло в указанную дату.\n"
+        "1. Проверь, что событие ДЕЙСТВИТЕЛЬНО произошло {{ today_md }} (в указанную дату).\n"
         "2. Убедись, что у события есть герой/конфликт/драма — что из него можно сделать сильную историю.\n"
         "3. Расширь описание: добавь 2–3 детали, которые делают историю живой.\n"
         "4. Добавь 2–3 надёжных источника.\n"
@@ -195,8 +230,29 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "Верни JSON:\n"
         '{ "validated": [ {"title": str, "summary_extended": str, "sources": [str], '
         '"is_valid": bool, "reject_reason": str|null} ], "missing_count": int }'
+        "{% else %}"
+        "You are a fact checker for the \"Backdated\" project.\n"
+        "Today: {{ today_human }}.\n\n"
+        "For each topic in the list:\n"
+        "1. Verify the event actually happened on {{ today_md }} (the listed date).\n"
+        "2. Make sure there is a hero/conflict/drama — material for a strong story.\n"
+        "3. Expand the description: add 2–3 details that bring the story to life.\n"
+        "4. Add 2–3 reliable sources.\n"
+        "5. Mark is_valid=true ONLY if the date is correct AND the story is strong.\n\n"
+        "Reject topics that:\n"
+        "- Have a wrong date.\n"
+        "- Have no internal conflict/drama/hero.\n"
+        "- Are too trivial ('X was born' with no angle).\n\n"
+        "Target confirmed count: {{ params.confirmed_topics_target }}.\n\n"
+        "Candidates:\n"
+        "{% for t in candidate_topics %}- {{ t.title }}: {{ t.angle }}\n{% endfor %}\n\n"
+        "Return JSON:\n"
+        '{ "validated": [ {"title": str, "summary_extended": str, "sources": [str], '
+        '"is_valid": bool, "reject_reason": str|null} ], "missing_count": int }'
+        "{% endif %}"
     ),
     "topic_ranker": (
+        "{% if language == 'ru' %}"
         "Ты — главный редактор проекта «Задним числом».\n\n"
         "Оцени каждую тему по 5 критериям (0–10):\n"
         "1. **hook** — сила первого впечатления: есть ли парадокс, контраст, загадка?\n"
@@ -210,8 +266,24 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "Верни JSON:\n"
         '{ "ranked": [ {"title": str, "scores": {"hook":int,"drama":int,"novelty":int,'
         '"virality":int,"modern_link":int}, "score_total": number, "rationale": str} ] }'
+        "{% else %}"
+        "You are the editor-in-chief of the \"Backdated\" project.\n\n"
+        "Score each topic on 5 criteria (0–10):\n"
+        "1. **hook** — strength of the first impression: paradox, contrast, mystery?\n"
+        "2. **drama** — depth of conflict: hero vs circumstances, stakes, price of a decision.\n"
+        "3. **novelty** — how unexpected the topic is for a casual reader.\n"
+        "4. **virality** — will the reader want to retell it to a friend?\n"
+        "5. **modern_link** — does it resonate with today?\n\n"
+        "Weights: hook=0.25, drama=0.25, novelty=0.2, virality=0.2, modern_link=0.1\n\n"
+        "Topics:\n"
+        "{% for t in validated_topics %}- {{ t.title }}: {{ t.summary_extended }}\n{% endfor %}\n\n"
+        "Return JSON:\n"
+        '{ "ranked": [ {"title": str, "scores": {"hook":int,"drama":int,"novelty":int,'
+        '"virality":int,"modern_link":int}, "score_total": number, "rationale": str} ] }'
+        "{% endif %}"
     ),
     "researcher": (
+        "{% if language == 'ru' %}"
         "Ты — исследователь проекта «Задним числом».\n\n"
         "Тема: \"{{ topic.title }}\"\n"
         "Контекст: {{ topic.summary_extended }}\n\n"
@@ -234,8 +306,33 @@ ZADNIM_PROMPTS: dict[str, str] = {
         '"hero": str, "conflict": str, "unexpected_detail": str, '
         '"modern_relevance": str, "visual_idea": str, '
         '"open_questions":[str] }'
+        "{% else %}"
+        "You are a researcher for the \"Backdated\" project.\n\n"
+        "Topic: \"{{ topic.title }}\"\n"
+        "Context: {{ topic.summary_extended }}\n\n"
+        "Your task: build a FULL research brief for the article writer.\n\n"
+        "What to find:\n"
+        "- Who is the hero/heroes? Short bio, motives.\n"
+        "- What is the conflict? What was at stake?\n"
+        "- Timeline: before, the event itself, aftermath.\n"
+        "- Unexpected details: small things that will surprise the reader.\n"
+        "- Quotes from participants (if any).\n"
+        "- Consequences: how the event shaped the future.\n"
+        "- Modern relevance.\n"
+        "- Visual potential: what could be shown in an illustration.\n\n"
+        "Minimum facts: {{ params.min_facts }}.\n"
+        "Use web_search and fetch_url.\n\n"
+        "Return JSON:\n"
+        '{ "facts":[{"claim":str,"source":str}], '
+        '"stats":[{"value":str,"context":str,"source":str}], '
+        '"quotes":[{"who":str,"what":str,"source":str}], '
+        '"hero": str, "conflict": str, "unexpected_detail": str, '
+        '"modern_relevance": str, "visual_idea": str, '
+        '"open_questions":[str] }'
+        "{% endif %}"
     ),
     "research_validator": (
+        "{% if language == 'ru' %}"
         "Ты — старший фактчекер проекта «Задним числом».\n\n"
         "Перепроверь исследовательское досье. Для каждого факта:\n"
         "- Верна ли дата? Верны ли имена, цифры, места?\n"
@@ -245,8 +342,20 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "Верни исправленную версию в ТОМ ЖЕ формате, что получил на входе.\n"
         "Если всё верно — верни как есть.\n\n"
         "Досье:\n{{ research_brief }}"
+        "{% else %}"
+        "You are a senior fact checker for the \"Backdated\" project.\n\n"
+        "Re-verify the research brief. For each fact:\n"
+        "- Is the date correct? Names, numbers, places?\n"
+        "- Is the source reliable?\n"
+        "- Is anything replaced by legend rather than fact?\n\n"
+        "If you find an error — FIX it in place. Do not write an error log.\n"
+        "Return the corrected version in the SAME format as the input.\n"
+        "If everything is correct — return it as is.\n\n"
+        "Brief:\n{{ research_brief }}"
+        "{% endif %}"
     ),
     "article_writer": (
+        "{% if language == 'ru' %}"
         "Ты — автор проекта «Задним числом». Твоя задача: написать ЖИВУЮ историю, не энциклопедическую справку.\n\n"
         "Тема: \"{{ topic.title }}\"\n\n"
         "ПРАВИЛА:\n"
@@ -263,8 +372,27 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "Верни JSON:\n"
         '{ "title_working": str, "body_md": str (markdown), "key_points": [str], '
         '"tldr": str, "tags": [str] }'
+        "{% else %}"
+        "You are a writer for the \"Backdated\" project. Your task: tell a LIVING story, not an encyclopedia entry.\n\n"
+        "Topic: \"{{ topic.title }}\"\n\n"
+        "RULES:\n"
+        "1. Do NOT start with a date. Start with a hero, a conflict, a paradox or a dramatic moment.\n"
+        "2. The date appears naturally through the text.\n"
+        "3. The piece must feel like a great storyteller's tale, not Wikipedia.\n"
+        "4. Short paragraphs (2–4 sentences). Empty line between paragraphs.\n"
+        "5. No bureaucratese, academic dryness, clichés.\n"
+        "6. Required arc: hook → context → conflict → development → unexpected detail → consequences → modern echo → ending.\n"
+        "7. Ending: a strong meaningful close, not 'thus'.\n"
+        "8. Length: {{ params.target_chars }} characters.\n\n"
+        "Style: {{ project.style_guide }}\n\n"
+        "Research brief:\n{{ research_validated }}\n\n"
+        "Return JSON:\n"
+        '{ "title_working": str, "body_md": str (markdown), "key_points": [str], '
+        '"tldr": str, "tags": [str] }'
+        "{% endif %}"
     ),
     "headline_writer": (
+        "{% if language == 'ru' %}"
         "Ты — создатель заголовков для проекта «Задним числом».\n\n"
         "Статья: \"{{ article.title_working }}\"\n"
         "TL;DR: {{ article.tldr }}\n\n"
@@ -278,8 +406,24 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "Заголовок должен цеплять, но НЕ обманывать.\n\n"
         "Верни JSON:\n"
         '{ "headlines": [ {"text": str, "style": str, "char_count": int} ] }'
+        "{% else %}"
+        "You are a headline writer for the \"Backdated\" project.\n\n"
+        "Article: \"{{ article.title_working }}\"\n"
+        "TL;DR: {{ article.tldr }}\n\n"
+        "Create {{ params.headlines_per_article }} headline variants. Styles:\n"
+        "- Paradox: 'They called him a failure. Until...'\n"
+        "- Contrast: 'The world remembered her smile. She remembered the hunger.'\n"
+        "- Price of a choice: 'One order. Decades of consequences.'\n"
+        "- Question: 'Why did the man they called a saviour...?'\n"
+        "- Hidden story: 'Officially it began on this day. The real reason was...'\n\n"
+        "IMPORTANT: the headline must NOT start with a date! A date is not a hook.\n"
+        "The headline must hook, but NOT mislead.\n\n"
+        "Return JSON:\n"
+        '{ "headlines": [ {"text": str, "style": str, "char_count": int} ] }'
+        "{% endif %}"
     ),
     "image_prompt_writer": (
+        "{% if language == 'ru' %}"
         "Ты — промт-инженер для иллюстраций проекта «Задним числом».\n\n"
         "Статья: \"{{ article.title_working }}\"\n"
         "TL;DR: {{ article.tldr }}\n\n"
@@ -287,11 +431,26 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "Стиль: кинематографичный, драматичный, исторический.\n"
         "Формат: 16:9.\n"
         "Описывай СЦЕНУ, а не текст — генератор картинок не умеет рисовать буквы.\n"
-        "Промт должен содержать: объект, обстановку, освещение, настроение, эпоху.\n\n"
+        "Промт должен содержать: объект, обстановку, освещение, настроение, эпоху.\n"
+        "Промт пиши на английском (генератор лучше понимает английский).\n\n"
         "Верни JSON:\n"
         '{ "image_prompts": [ {"prompt": str, "negative": str, "aspect": "16:9", "seed": null} ] }'
+        "{% else %}"
+        "You are a prompt engineer for illustrations of the \"Backdated\" project.\n\n"
+        "Article: \"{{ article.title_working }}\"\n"
+        "TL;DR: {{ article.tldr }}\n\n"
+        "Create {{ params.images_per_article }} prompts for image generation.\n"
+        "Style: cinematic, dramatic, historical.\n"
+        "Format: 16:9.\n"
+        "Describe a SCENE, not text — the image model cannot render letters.\n"
+        "The prompt must include: subject, setting, lighting, mood, era.\n"
+        "Write the prompt in English (the model handles English best).\n\n"
+        "Return JSON:\n"
+        '{ "image_prompts": [ {"prompt": str, "negative": str, "aspect": "16:9", "seed": null} ] }'
+        "{% endif %}"
     ),
     "qa_editorial": (
+        "{% if language == 'ru' %}"
         "Ты — главный редактор проекта «Задним числом».\n\n"
         "Проверь статью по критериям:\n"
         "1. Начинается ли текст с крючка (НЕ с даты)?\n"
@@ -308,14 +467,40 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "Верни JSON:\n"
         '{ "chosen_headline": str, "revised_body_md": str, '
         '"issues":[{"severity":"low|med|high","note":str}], "score": int }'
+        "{% else %}"
+        "You are the editor-in-chief of the \"Backdated\" project.\n\n"
+        "Review the article against these criteria:\n"
+        "1. Does it open with a hook (NOT a date)?\n"
+        "2. Is there a hero, conflict, stakes?\n"
+        "3. Does it feel like a living story, not a reference entry?\n"
+        "4. No bureaucratese, padding, clichés?\n"
+        "5. Is there an unexpected detail?\n"
+        "6. Is there a modern echo?\n"
+        "7. Is the ending strong?\n\n"
+        "Pick the best headline from the variants.\n"
+        "If the text feels dry — add life with minimal edits.\n\n"
+        "Article:\n{{ article.body_md }}\n\n"
+        "Headline variants:\n{{ headlines }}\n\n"
+        "Return JSON:\n"
+        '{ "chosen_headline": str, "revised_body_md": str, '
+        '"issues":[{"severity":"low|med|high","note":str}], "score": int }'
+        "{% endif %}"
     ),
     "qa_visual": (
+        "{% if language == 'ru' %}"
         "Выбери лучшую картинку для статьи «{{ article.title_working }}» проекта «Задним числом».\n"
         "Критерии: драматичность, соответствие эпохе, эмоциональная сила, кинематографичность.\n\n"
         "Варианты:\n{{ image_options }}\n\n"
         "Верни JSON: { \"chosen_index\": int, \"rationale\": str }"
+        "{% else %}"
+        "Pick the best image for the \"Backdated\" project article \"{{ article.title_working }}\".\n"
+        "Criteria: drama, period accuracy, emotional power, cinematic feel.\n\n"
+        "Variants:\n{{ image_options }}\n\n"
+        "Return JSON: { \"chosen_index\": int, \"rationale\": str }"
+        "{% endif %}"
     ),
     "video_scenarist": (
+        "{% if language == 'ru' %}"
         "Ты — сценарист коротких видео для проекта «Задним числом».\n\n"
         "Из статьи сделай сценарий видео длительностью {{ params.target_duration_s }} секунд.\n"
         "Формат: 9:16 (вертикальное).\n"
@@ -329,6 +514,21 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "Верни JSON:\n"
         '{ "hook": str, "scenes": [ {"idx": int, "voiceover": str, '
         '"on_screen_text": str, "b_roll_idea": str, "duration_s": number} ], "cta": str }'
+        "{% else %}"
+        "You are a short-form video scenarist for the \"Backdated\" project.\n\n"
+        "Turn the article into a {{ params.target_duration_s }}-second video script.\n"
+        "Format: 9:16 (vertical).\n"
+        "Style: cinematic, dramatic, with a voice-over narrator.\n\n"
+        "Rules:\n"
+        "- The first second (hook) is the strongest phrase that stops the scroll.\n"
+        "- 5–8 scenes, 4–6 seconds each.\n"
+        "- Each scene: voice-over + on-screen visual (what to show).\n"
+        "- The last scene: a strong period, not 'subscribe'.\n\n"
+        "Article:\n{{ article.body_md }}\n\n"
+        "Return JSON:\n"
+        '{ "hook": str, "scenes": [ {"idx": int, "voiceover": str, '
+        '"on_screen_text": str, "b_roll_idea": str, "duration_s": number} ], "cta": str }'
+        "{% endif %}"
     ),
 }
 
@@ -448,8 +648,10 @@ def seed(settings: Settings) -> dict[str, str]:
             role = entry["role"]
             lang = entry["language"]
 
-            # Use project-specific prompt if role is in ZADNIM_PROMPTS
-            if role in ZADNIM_PROMPTS and lang in ("ru", "bi"):
+            # Use project-specific prompt if role is in ZADNIM_PROMPTS.
+            # ZADNIM_PROMPTS now use bilingual {% if language == 'ru' %}...{% else %}...{% endif %},
+            # so they apply to ALL languages (ru, en, bi).
+            if role in ZADNIM_PROMPTS:
                 prompt = ZADNIM_PROMPTS[role]
             else:
                 prompt = spec.prompt_template

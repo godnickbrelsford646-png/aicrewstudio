@@ -325,8 +325,15 @@ async function runPhase(slug, phase) {
   toast(labels[phase] || "Запуск…");
   try {
     await api(`/api/projects/${slug}/${map[phase]}`, { method: "POST", body: {} });
-    toast("Готово. Обновляю страницу…", "success");
-    setTimeout(() => location.reload(), 800);
+    // Полный цикл и любые тяжёлые фазы запускаются в фоне на сервере —
+    // соединение возвращает 202 сразу. Сообщаем пользователю и обновляем
+    // страницу через 5 секунд, чтобы успели обновиться счётчики/запуски.
+    if (phase === "full") {
+      toast("Запущено в фоне, обновится через 2–3 минуты", "success");
+    } else {
+      toast("Запущено в фоне, обновится автоматически", "success");
+    }
+    setTimeout(() => location.reload(), 5000);
   } catch (e) { toast("Ошибка: " + e.message, "error"); }
 }
 

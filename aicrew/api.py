@@ -205,8 +205,28 @@ def _run_full(h: "AicrewHandler", p: dict[str, str]) -> None:
     if project is None:
         return
     runner = PipelineRunner(h.settings)
-    s = runner.run_full(project["id"])
-    h.send_json(200, s.__dict__)
+    # Полный пайплайн через реальные API длится 1–3 минуты, поэтому
+    # стартуем его в фоне и сразу отдаём 202 с pipeline_run_id.
+    # Запись pipeline_run создаётся СРАЗУ (до старта потока), чтобы
+    # клиент мог видеть её в списке запусков.
+    prid = runner.create_pipeline_run(project["id"], kind="full")
+
+    def _worker(pid: str, run_id: str, settings: Settings) -> None:
+        try:
+            # Каждый поток создаёт свой PipelineRunner, чтобы не делить
+            # SQLite-соединения между потоками.
+            local_runner = PipelineRunner(settings)
+            local_runner.run_full(pid, pipeline_run_id=run_id)
+        except Exception:
+            log.exception("background run_full failed for project=%s run=%s", pid, run_id)
+
+    threading.Thread(
+        target=_worker,
+        args=(project["id"], prid, h.settings),
+        daemon=True,
+        name=f"aicrew-runfull-{prid}",
+    ).start()
+    h.send_json(202, {"pipeline_run_id": prid, "status": "started"})
 
 
 # ------------- agents ----------------------------------------------------

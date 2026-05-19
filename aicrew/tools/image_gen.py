@@ -206,12 +206,18 @@ def _call_real_provider(prompt: str, model: str, settings: Settings
         ) from exc
 
     item = (payload.get("data") or [{}])[0]
-    # 302.ai may return either b64_json or an URL; handle both.
+    # 302.ai may return either b64_json, an URL, or a task_id (async mode).
+    # Async polling is not implemented in this MVP — fall back to placeholder.
     if item.get("b64_json"):
         data = base64.b64decode(item["b64_json"])
     elif item.get("url"):
         with urllib.request.urlopen(item["url"], timeout=120) as r:
             data = r.read()
+    elif item.get("task_id") or payload.get("task_id"):
+        log.warning("image API returned async task, polling not implemented; "
+                    "falling back to placeholder. payload=%s",
+                    str(payload)[:300])
+        raise RuntimeError("image provider returned async task_id (polling not implemented)")
     else:
         raise RuntimeError(f"image response missing data: {payload}")
     # Best-effort PNG dimensions extraction.

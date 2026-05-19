@@ -14,6 +14,37 @@ from ..logging_setup import set_agent_run
 from ..templates import render
 
 
+_RU_MONTHS = (
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+_EN_MONTHS = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def _today_human(language: str, ts: float | None = None) -> tuple[str, str, str]:
+    """Returns (today_iso, today_human, today_md):
+        today_iso     = '2026-05-19' (YYYY-MM-DD, UTC)
+        today_human   = '19 мая 2026' (ru) or 'May 19, 2026' (en)
+        today_md      = '19 мая' (ru) or 'May 19' (en) — month-day, без года
+    Used to push today's date into prompts.
+    """
+    tm = time.gmtime(ts) if ts is not None else time.gmtime()
+    iso = time.strftime("%Y-%m-%d", tm)
+    month_idx = tm.tm_mon - 1
+    day = tm.tm_mday
+    year = tm.tm_year
+    if (language or "").lower().startswith("en"):
+        human = f"{_EN_MONTHS[month_idx]} {day}, {year}"
+        md = f"{_EN_MONTHS[month_idx]} {day}"
+    else:
+        human = f"{day} {_RU_MONTHS[month_idx]} {year}"
+        md = f"{day} {_RU_MONTHS[month_idx]}"
+    return iso, human, md
+
+
 @dataclass
 class AgentRunResult:
     agent_run_id: str
@@ -41,10 +72,22 @@ class AgentExecutor:
         agent_run_id = db.new_id("ar_")
         set_agent_run(agent_run_id)
         params = db.jload(agent["params"], {}) if isinstance(agent["params"], str) else agent["params"]
-        # ensure language present in inputs for templates
+        # Resolve language for the prompt:
+        #   - агент с явным языком (ru/en) использует его;
+        #   - агент с language='bi' (общие на проект: topic_generator,
+        #     topic_validator, topic_ranker) берёт язык из inputs, либо 'ru'
+        #     по умолчанию (основной язык проекта «Задним числом»).
+        agent_lang = (agent.get("language") or "").lower()
+        if agent_lang in ("ru", "en"):
+            language = agent_lang
+        else:
+            language = (inputs.get("language") or "ru").lower()
+        today_iso, today_human, today_md = _today_human(language)
         ctx = {
-            "today": time.strftime("%Y-%m-%d", time.gmtime()),
-            "language": agent.get("language") or inputs.get("language") or "ru",
+            "today": today_iso,
+            "today_human": today_human,
+            "today_md": today_md,
+            "language": language,
             "params": params,
             **inputs,
         }

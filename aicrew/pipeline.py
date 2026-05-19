@@ -80,11 +80,21 @@ class PipelineRunner:
         if not (gen and val and ranker):
             raise RuntimeError("topic agents missing in project")
 
-        target = int(json.loads(val["params"]).get("confirmed_topics_target", 5))
-        max_retries = int(json.loads(val["params"]).get("max_retries", 3))
+        # Single source of truth for the target: project.daily_topics_target.
+        # The validator's confirmed_topics_target is kept in sync per-run so
+        # the agent prompt sees the right number, but the loop is driven by
+        # the project setting.
+        target = max(1, int(project.get("daily_topics_target") or 0))
+        val_params = json.loads(val["params"]) if isinstance(val["params"], str) else dict(val["params"] or {})
+        val_params["confirmed_topics_target"] = target
+        val_runtime = dict(val)
+        val_runtime["params"] = json.dumps(val_params)
+
+        max_retries = max(int(val_params.get("max_retries", 5) or 5), 5)
         forbidden = self._memory_forbidden_titles(project_id)
         confirmed: list[dict[str, Any]] = []
 
+        log.info("topic phase: project=%s target=%d max_retries=%d", project_id, target, max_retries)
         for attempt in range(max_retries):
             gen_out = self.executor.run(
                 agent=gen, pipeline_run_id=prid,
@@ -92,14 +102,20 @@ class PipelineRunner:
             ).output
             cands = gen_out.get("topics", [])
             val_out = self.executor.run(
-                agent=val, pipeline_run_id=prid,
+                agent=val_runtime, pipeline_run_id=prid,
                 inputs={"candidate_topics": cands},
             ).output
             for v in val_out.get("validated", []):
                 if v.get("is_valid") and v["title"] not in [c["title"] for c in confirmed]:
                     confirmed.append(v)
+            log.info("topic phase: attempt %d/%d -> confirmed=%d / target=%d",
+                     attempt + 1, max_retries, len(confirmed), target)
             if len(confirmed) >= target:
                 break
+
+        if len(confirmed) < target:
+            log.warning("topic phase: stopped with %d confirmed of %d target after %d attempts",
+                        len(confirmed), target, max_retries)
 
         rank_out = self.executor.run(
             agent=ranker, pipeline_run_id=prid,
@@ -436,6 +452,12 @@ class PipelineRunner:
             )
         return prid
 
+    # Public alias: создать запись pipeline_run и вернуть id ДО старта работы.
+    # Используется API для асинхронного запуска: id отдаётся клиенту сразу,
+    # а фактическая работа крутится в фоне с этим id.
+    def create_pipeline_run(self, project_id: str, kind: str = "full") -> str:
+        return self._start_pipeline_run(project_id, kind)
+
     def _memory_forbidden_titles(self, project_id: str) -> list[str]:
         with db.connect(self.settings.db_path) as conn:
             rows = conn.execute(
@@ -458,10 +480,29 @@ class PipelineRunner:
             log.warning("failed to decrypt credentials for channel %s: %s", channel.get("id"), exc)
             return {}
 
-    def run_full(self, project_id: str) -> PipelineSummary:
+    def run_full(self, project_id: str, *, pipeline_run_id: str | None = None) -> PipelineSummary:
+        """Run the full pipeline (topics → articles → publication).
+
+        If ``pipeline_run_id`` is provided, the existing pipeline_run row is
+        reused (so the API can hand the id to the client BEFORE the work
+        actually begins). Otherwise a new "topics" run is created at the
+        start of the topic phase, as before.
+        """
+        # The 'umbrella' pipeline_run row, if provided, is updated at the end
+        # to reflect the overall outcome. Each phase still creates its own
+        # phase-specific pipeline_run rows so the UI can show stage timings.
         prid_topics = self.run_topic_phase(project_id)
-        article_ids = self.run_article_phase(project_id)
-        pub = self.run_publication_phase(project_id)
+        try:
+            article_ids = self.run_article_phase(project_id)
+            pub = self.run_publication_phase(project_id)
+            status = "completed"
+            error: str | None = None
+        except Exception as exc:
+            log.exception("run_full failed for project=%s", project_id)
+            article_ids = []
+            pub = {"posts_created": 0, "posts_published": 0, "pipeline_run_id": ""}
+            status = "failed"
+            error = repr(exc)
         with db.connect(self.settings.db_path) as conn:
             ts = conn.execute("SELECT COUNT(*) c FROM topics WHERE project_id=?",
                               (project_id,)).fetchone()["c"]
@@ -474,8 +515,13 @@ class PipelineRunner:
                 "JOIN pipeline_runs pr ON pr.id=ar.pipeline_run_id WHERE pr.project_id=?",
                 (project_id,),
             ).fetchone()["c"]
+            if pipeline_run_id:
+                conn.execute(
+                    "UPDATE pipeline_runs SET status=?, finished_at=?, error=? WHERE id=?",
+                    (status, db.now_iso(), error, pipeline_run_id),
+                )
         return PipelineSummary(
-            pipeline_run_id=prid_topics,
+            pipeline_run_id=pipeline_run_id or prid_topics,
             topics_generated=ts,
             topics_validated=ranked,
             articles_written=len(article_ids),
