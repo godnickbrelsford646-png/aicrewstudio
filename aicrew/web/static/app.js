@@ -329,13 +329,14 @@ router.add("/projects/:pid", async ({ pid }) => {
     ),
   ));
 
-  const tabs = ["Pipeline", "Agents", "Topics", "Articles", "Channels", "Posts"];
+  const tabs = ["Pipeline", "Agents", "Topics", "Articles", "Channels", "Posts", "Settings"];
   const counts = {
     Agents: data.agents.length,
     Topics: data.topics.length,
     Articles: data.articles.length,
     Channels: data.channels.length,
   };
+  const TAB_RU_LOCAL = {...TAB_RU, Settings: "Настройки"};
   const tabbar = el("div", { class: "tabs" });
   const view = el("div", {});
   let active = "Pipeline";
@@ -343,7 +344,7 @@ router.add("/projects/:pid", async ({ pid }) => {
     const node = el("div", { class: "tab" + (t === active ? " active" : ""), on: {
       click: () => { active = t; render(); },
     }},
-      TAB_RU[t],
+      (TAB_RU_LOCAL[t] || TAB_RU[t] || t),
       counts[t] != null ? el("span", { class: "count" }, " · " + counts[t]) : null,
     );
     tabbar.append(node);
@@ -360,6 +361,7 @@ router.add("/projects/:pid", async ({ pid }) => {
     if (active === "Articles") view.append(renderArticlesTab(pid, data.articles));
     if (active === "Channels") view.append(renderChannelsTab(data.channels));
     if (active === "Posts") view.append(renderPostsTab(pid));
+    if (active === "Settings") view.append(renderSettingsTab(pid, p));
   }
   // правильный матч активной вкладки
   const setTabActive = () => {
@@ -382,6 +384,60 @@ async function runPhase(pid, phase) {
   } catch (e) {
     toast("Ошибка: " + e.message, "error");
   }
+}
+
+// ---------- вкладка: настройки проекта -----------------------------------------
+
+function renderSettingsTab(pid, p) {
+  function f(name, label, value, type = "text", hint = "") {
+    return el("label", { class: "field" },
+      label,
+      el("input", { type, value: value ?? "", "data-name": name }),
+      hint ? el("span", { class: "hint" }, hint) : null,
+    );
+  }
+  function fArea(name, label, value, hint = "") {
+    return el("label", { class: "field" },
+      label,
+      el("textarea", { value: value ?? "", "data-name": name, style: "min-height:100px" }),
+      hint ? el("span", { class: "hint" }, hint) : null,
+    );
+  }
+  const card = el("div", { class: "card" },
+    el("h2", {}, "⚙️ Настройки проекта"),
+    f("name", "Название проекта", p.name),
+    f("niche", "Ниша / тематика", p.niche, "text", "Темы агентов будут привязаны к этой нише."),
+    fArea("description", "Описание проекта", p.description, "Краткое описание — кто аудитория, какой тон."),
+    fArea("style_guide", "Стайл-гайд (тон голоса)", p.style_guide, "Описание стиля подачи: живой, экспертный, без воды и т.д."),
+    f("daily_topics_target", "Тем за один запуск", p.daily_topics_target, "number",
+      "Сколько тем генератор должен предложить за один прогон."),
+    f("daily_articles_target", "Статей за один запуск", p.daily_articles_target, "number",
+      "Сколько лучших тем из рейтинга берётся для написания статей."),
+    f("budget_usd_month", "Бюджет ($/мес)", p.budget_usd_month, "number",
+      "Лимит расходов на API моделей. При превышении пайплайн поставит на паузу."),
+    el("div", { class: "spacer" }),
+    el("div", { class: "row" },
+      el("button", { on: { click: saveProject } }, "💾 Сохранить"),
+      el("button", { class: "ghost", on: { click: () => location.reload() } }, "Отменить"),
+    ),
+  );
+  async function saveProject() {
+    const body = {};
+    for (const k of ["name", "niche", "description", "style_guide",
+                     "daily_topics_target", "daily_articles_target", "budget_usd_month"]) {
+      const inp = card.querySelector(`[data-name="${k}"]`);
+      if (!inp) continue;
+      const v = inp.value;
+      body[k] = ["daily_topics_target", "daily_articles_target"].includes(k) ? parseInt(v, 10)
+              : k === "budget_usd_month" ? parseFloat(v)
+              : v;
+    }
+    try {
+      await api(`/api/projects/${pid}`, { method: "PATCH", body });
+      toast("Настройки проекта сохранены", "success");
+    } catch (e) { toast("Ошибка: " + e.message, "error"); }
+  }
+  return card;
 }
 
 // ---------- вкладка: пайплайн -----------------------------------------------
@@ -819,14 +875,38 @@ router.add("/channels/:cid", async ({ cid }) => {
   }
   root.append(credsCard);
 
-  // расписание + параметры
+  // расписание + параметры (редактируемые)
   const slotsCard = el("div", { class: "card" }, el("h2", {}, "📅 Расписание и параметры"),
+    el("label", { class: "field" },
+      "Постов в день",
+      el("input", { type: "number", value: c.posts_per_day, "data-name": "posts_per_day", min: "1", max: "20" }),
+      el("span", { class: "hint" }, "При увеличении — добавьте слоты публикации."),
+    ),
+    el("label", { class: "field" },
+      "Стратегия выбора статей",
+      el("select", { "data-name": "selection_strategy" },
+        el("option", { value: "by_rank", selected: c.selection_strategy === "by_rank" }, "По рейтингу"),
+        el("option", { value: "random_among_written", selected: c.selection_strategy === "random_among_written" }, "Случайно из написанных"),
+      ),
+      el("span", { class: "hint" }, "«По рейтингу» — берём лучшие по баллу. «Случайно» — рандом среди ещё не опубликованных."),
+    ),
     el("div", { class: "kv" },
-      el("div", {}, "Постов в день"), el("div", {}, c.posts_per_day),
-      el("div", {}, "Выбор статей"), el("div", {}, STRATEGY_RU[c.selection_strategy] || c.selection_strategy),
       el("div", {}, "Лимит символов"), el("div", {}, spec.max_chars + " (для одного поста)"),
       el("div", {}, "Поддерживаемое медиа"), el("div", {}, spec.media_kinds.join(", ") || "—"),
     ),
+    el("div", { class: "spacer" }),
+    el("button", { on: {
+      click: async () => {
+        const body = {
+          posts_per_day: parseInt(slotsCard.querySelector('[data-name="posts_per_day"]').value, 10),
+          selection_strategy: slotsCard.querySelector('[data-name="selection_strategy"]').value,
+        };
+        try {
+          await api(`/api/channels/${cid}`, { method: "PATCH", body });
+          toast("Параметры канала сохранены", "success");
+        } catch (e) { toast("Ошибка: " + e.message, "error"); }
+      }
+    }}, "💾 Сохранить параметры"),
     el("div", { class: "spacer" }),
     el("h3", {}, "Слоты публикации (по локальному времени проекта)"),
     data.slots.length === 0

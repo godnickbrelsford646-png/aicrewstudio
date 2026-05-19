@@ -117,6 +117,61 @@ def _get_project(h: "AicrewHandler", p: dict[str, str]) -> None:
     })
 
 
+@route("PATCH", "/api/projects/{pid}")
+def _patch_project(h: "AicrewHandler", p: dict[str, str]) -> None:
+    if _project_or_404(h, p["pid"]) is None:
+        return
+    body = h.read_json() or {}
+    allowed = {"name", "niche", "description", "is_enabled", "timezone",
+               "language_modes", "daily_topics_target", "daily_articles_target",
+               "budget_usd_month", "style_guide"}
+    sets = []
+    args: list[Any] = []
+    for k, v in body.items():
+        if k not in allowed:
+            continue
+        sets.append(f"{k}=?")
+        if k == "language_modes" and isinstance(v, list):
+            args.append(json.dumps(v))
+        else:
+            args.append(v)
+    if not sets:
+        h.send_json(400, {"error": "no editable fields"})
+        return
+    sets.append("updated_at=?")
+    args.extend([db.now_iso(), p["pid"]])
+    with db.connect(h.settings.db_path) as conn:
+        conn.execute(f"UPDATE projects SET {','.join(sets)} WHERE id=?", args)
+    h.send_json(200, {"ok": True})
+
+
+@route("PATCH", "/api/channels/{cid}")
+def _patch_channel(h: "AicrewHandler", p: dict[str, str]) -> None:
+    with db.connect(h.settings.db_path) as conn:
+        row = conn.execute("SELECT * FROM channels WHERE id=?", (p["cid"],)).fetchone()
+        if not row:
+            h.send_json(404, {"error": "channel not found"})
+            return
+    body = h.read_json() or {}
+    allowed = {"name", "language", "posts_per_day", "selection_strategy",
+               "rewriter_prompt", "is_enabled"}
+    sets = []
+    args: list[Any] = []
+    for k, v in body.items():
+        if k not in allowed:
+            continue
+        sets.append(f"{k}=?")
+        args.append(v)
+    if not sets:
+        h.send_json(400, {"error": "no editable fields"})
+        return
+    sets.append("updated_at=?")
+    args.extend([db.now_iso(), p["cid"]])
+    with db.connect(h.settings.db_path) as conn:
+        conn.execute(f"UPDATE channels SET {','.join(sets)} WHERE id=?", args)
+    h.send_json(200, {"ok": True})
+
+
 @route("POST", "/api/projects/{pid}/runs/topics")
 def _run_topics(h: "AicrewHandler", p: dict[str, str]) -> None:
     if _project_or_404(h, p["pid"]) is None:
