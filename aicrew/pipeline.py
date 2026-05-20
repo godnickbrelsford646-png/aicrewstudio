@@ -240,7 +240,57 @@ class PipelineRunner:
                 "UPDATE pipeline_runs SET status=?, finished_at=? WHERE id=?",
                 ("completed", db.now_iso(), prid),
             )
+        # Safety net: ensure every article in this run shares a chosen_image_id
+        # with at least one sibling article of the same topic. Protects against:
+        #   * old DBs where _generate_topic_image was per-article and only the
+        #     first language got an image;
+        #   * topics where image generation had a transient error in some
+        #     branches but succeeded in another.
+        # Only NULL chosen_image_id rows are touched; existing assignments are
+        # preserved.
+        self._propagate_topic_images(article_ids)
         return article_ids
+
+    def _propagate_topic_images(self, article_ids: list[str]) -> None:
+        """For each topic touched in this article phase, if any of its articles
+        already has chosen_image_id, copy that id to every sibling article of
+        the same topic that still has chosen_image_id NULL.
+
+        Runs in a single SQLite transaction so it is cheap even with many
+        articles and is safe to re-run.
+        """
+        if not article_ids:
+            return
+        with db.connect(self.settings.db_path) as conn:
+            # Distinct topic_ids touched in this run.
+            placeholders = ",".join("?" for _ in article_ids)
+            topic_ids = [
+                r["topic_id"] for r in conn.execute(
+                    f"SELECT DISTINCT topic_id FROM articles WHERE id IN ({placeholders})",
+                    article_ids,
+                ).fetchall() if r["topic_id"]
+            ]
+            for tid in topic_ids:
+                row = conn.execute(
+                    "SELECT chosen_image_id FROM articles "
+                    "WHERE topic_id=? AND chosen_image_id IS NOT NULL "
+                    "AND chosen_image_id <> '' LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if not row:
+                    log.warning("topic %s: no image attached to any article "
+                                "after article phase (image gen likely failed "
+                                "for all languages)", tid)
+                    continue
+                cur = conn.execute(
+                    "UPDATE articles SET chosen_image_id=? "
+                    "WHERE topic_id=? AND (chosen_image_id IS NULL OR chosen_image_id='')",
+                    (row["chosen_image_id"], tid),
+                )
+                if cur.rowcount:
+                    log.info("topic %s: propagated chosen_image_id to %d "
+                             "previously-unlinked article(s)",
+                             tid, cur.rowcount)
 
     def _write_article_text(self, project: dict[str, Any],
                              agents: dict[tuple[str, str], dict[str, Any]],
@@ -420,6 +470,12 @@ class PipelineRunner:
                     "UPDATE articles SET chosen_image_id=? WHERE id=?",
                     (chosen_image_id, article_id),
                 )
+        log.info(
+            "topic %s: image attached to %d article(s) (lang=%s); chosen_image_id=%s",
+            topic["id"], len(written),
+            ",".join(lang for _, lang, _ in written),
+            chosen_image_id,
+        )
 
     # ---------------- publication phase ----------------------------------
 

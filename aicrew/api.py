@@ -430,6 +430,73 @@ def _list_posts(h: "AicrewHandler", p: dict[str, str]) -> None:
     h.send_json(200, {"posts": rows})
 
 
+@route("GET", "/api/projects/{pkey}/topics/{tid}")
+def _get_topic(h: "AicrewHandler", p: dict[str, str]) -> None:
+    """Topic detail page. Returns:
+        topic         — full topic row (incl. event_date, scores, sources)
+        articles      — articles already written from this topic (per language)
+        agent_runs    — agent runs that touched this topic specifically
+                        (researcher / research_validator / article_writer /
+                        headline_writer / qa_editorial / qa_visual /
+                        image_prompt_writer; their topic_id is set in
+                        executor.run() calls).
+        topic_phase_runs — runs from the SAME pipeline_run that produced
+                        the topic (topic_generator / topic_validator /
+                        topic_ranker). Their topic_id is NULL because
+                        they operate on batches, but their input/output
+                        contains this topic title in JSON. We surface them
+                        so the user can see what the search agents
+                        collected and how the ranker scored it.
+    """
+    project = _resolve_project(h, p["pkey"])
+    if project is None:
+        return
+    with db.connect(h.settings.db_path) as conn:
+        topic = conn.execute(
+            "SELECT * FROM topics WHERE id=? AND project_id=?",
+            (p["tid"], project["id"]),
+        ).fetchone()
+        if not topic:
+            h.send_json(404, {"error": "topic not found"})
+            return
+        topic = db.row_to_dict(topic)
+        articles = db.rows_to_list(conn.execute(
+            "SELECT id, language, status, chosen_headline, chosen_image_id, "
+            "qa_score, created_at, written_at "
+            "FROM articles WHERE topic_id=? ORDER BY language",
+            (topic["id"],),
+        ).fetchall())
+        # agent_runs scoped to this topic (per-topic agents).
+        runs = db.rows_to_list(conn.execute(
+            "SELECT ar.*, a.role AS agent_role, a.language AS agent_language, "
+            "a.display_name AS agent_display_name "
+            "FROM agent_runs ar LEFT JOIN agents a ON a.id=ar.agent_id "
+            "WHERE ar.topic_id=? ORDER BY ar.started_at",
+            (topic["id"],),
+        ).fetchall())
+        # Topic-phase runs come from the same pipeline_run that produced the
+        # topic. They have topic_id NULL but their inputs/outputs reference
+        # this topic by title in JSON.
+        phase_runs: list[dict[str, Any]] = []
+        if topic.get("pipeline_run_id"):
+            phase_runs = db.rows_to_list(conn.execute(
+                "SELECT ar.*, a.role AS agent_role, a.language AS agent_language, "
+                "a.display_name AS agent_display_name "
+                "FROM agent_runs ar LEFT JOIN agents a ON a.id=ar.agent_id "
+                "WHERE ar.pipeline_run_id=? AND ar.topic_id IS NULL "
+                "AND a.role IN ('topic_generator','topic_validator','topic_ranker') "
+                "ORDER BY ar.started_at",
+                (topic["pipeline_run_id"],),
+            ).fetchall())
+    h.send_json(200, {
+        "project": {"id": project["id"], "slug": project["slug"], "name": project["name"]},
+        "topic": topic,
+        "articles": articles,
+        "agent_runs": runs,
+        "topic_phase_runs": phase_runs,
+    })
+
+
 @route("GET", "/api/projects/{pkey}/articles/{aid}")
 def _get_article(h: "AicrewHandler", p: dict[str, str]) -> None:
     project = _resolve_project(h, p["pkey"])

@@ -269,7 +269,14 @@ router.add("/projects", async () => {
 
 // ---------- карточка проекта (slug) -----------------------------------------
 
-router.add("/projects/:pkey", async ({ pkey }) => {
+router.add("/projects/:pkey", async ({ pkey }) => loadProject(pkey, "Pipeline"));
+router.add("/projects/:pkey/tab/:tab", async ({ pkey, tab }) => {
+  const map = { pipeline:"Pipeline", agents:"Agents", topics:"Topics",
+    articles:"Articles", channels:"Channels", posts:"Posts", settings:"Settings" };
+  return loadProject(pkey, map[tab.toLowerCase()] || "Pipeline");
+});
+
+async function loadProject(pkey, initialTab) {
   const root = $("#root");
   root.innerHTML = "";
   const data = await api(`/api/projects/${pkey}`);
@@ -293,10 +300,19 @@ router.add("/projects/:pkey", async ({ pkey }) => {
   };
   const tabbar = el("div", { class: "tabs" });
   const view = el("div", {});
-  let active = "Pipeline";
+  let active = initialTab && tabs.includes(initialTab) ? initialTab : "Pipeline";
   for (const t of tabs) {
-    const node = el("div", { class: "tab", on: { click: () => { active = t; render(); } } },
-      TAB_RU[t], counts[t] != null ? el("span", { class: "count" }, " · " + counts[t]) : null);
+    // Каждая вкладка — отдельный hash-маршрут. Pipeline — корневой URL
+    // проекта (#/projects/<slug>), остальные — под /tab/<name>. Так
+    // браузерная стрелка «Назад» корректно перемещается между вкладками.
+    const href = t === "Pipeline"
+      ? `#/projects/${slug}`
+      : `#/projects/${slug}/tab/${t.toLowerCase()}`;
+    const node = el("a", {
+      class: "tab",
+      href,
+      style: "text-decoration:none;color:inherit",
+    }, TAB_RU[t], counts[t] != null ? el("span", { class: "count" }, " · " + counts[t]) : null);
     tabbar.append(node);
   }
   root.append(tabbar);
@@ -307,7 +323,7 @@ router.add("/projects/:pkey", async ({ pkey }) => {
     [...tabbar.children].forEach((node, i) => node.classList.toggle("active", tabs[i] === active));
     if (active === "Pipeline") view.append(renderPipelineTab(data));
     if (active === "Agents") view.append(renderAgentsTab(slug, data.agents));
-    if (active === "Topics") view.append(renderTopicsTab(data.topics));
+    if (active === "Topics") view.append(renderTopicsTab(slug, data.topics));
     if (active === "Articles") view.append(renderArticlesTab(slug, data.articles));
     if (active === "Channels") view.append(renderChannelsTab(slug, data.channels));
     if (active === "Posts") view.append(renderPostsTab(slug));
@@ -315,7 +331,7 @@ router.add("/projects/:pkey", async ({ pkey }) => {
   }
   render();
   stamp();
-});
+}
 
 async function runPhase(slug, phase) {
   const map = { topics: "runs/topics", articles: "runs/articles",
@@ -414,11 +430,17 @@ function renderAgentsTab(projectSlug, agents) {
 
 function agentCard(projectSlug, a) {
   const slug = a.slug || a.id;
+  // For channel_rewriter the role label "Адаптер для канала" is the same
+  // for every channel, so we show the per-channel display_name instead
+  // (seed.py builds it as "Адаптер — Задним числом · Telegram" etc.).
+  const headline = (a.role === "channel_rewriter" && a.display_name)
+    ? a.display_name
+    : (ROLE_RU[a.role] || a.display_name);
   return el("a", { href: `#/projects/${projectSlug}/agents/${slug}`,
       style: "text-decoration:none;color:inherit" },
     el("div", { class: "card card-hover" },
       el("div", { class: "row between" },
-        el("h2", { style: "margin:0;font-size:15px" }, ROLE_RU[a.role] || a.display_name),
+        el("h2", { style: "margin:0;font-size:15px" }, headline),
         el("div", { class: "row" }, langTag(a.language))),
       el("div", { class: "muted", style: "font-size:13px;margin:6px 0 12px 0" },
         ROLE_DESC[a.role] || a.description),
@@ -433,22 +455,27 @@ function agentCard(projectSlug, a) {
 
 // ---------- вкладка: темы ---------------------------------------------------
 
-function renderTopicsTab(topics) {
+function renderTopicsTab(projectSlug, topics) {
   if (!topics.length)
     return emptyState("💡", "Тем пока нет", "Нажмите «Темы» наверху, чтобы запустить агентов сбора тем.");
   return el("div", { class: "card" }, el("h2", {}, "Темы (" + topics.length + ")"),
     el("table", {},
       el("thead", {}, el("tr", {},
-        el("th", {}, "Тема"), el("th", {}, "Статус"),
-        el("th", {}, "Рейтинг"), el("th", {}, "Оценки"))),
+        el("th", {}, "Тема"), el("th", {}, "Дата события"), el("th", {}, "Статус"),
+        el("th", {}, "Рейтинг"), el("th", {}, "Оценки"), el("th", {}, ""))),
       el("tbody", {}, ...topics.map(t => {
         const scores = JSON.parse(t.scores || "{}");
-        return el("tr", {},
-          el("td", { style: "max-width:520px" }, t.title),
+        return el("tr", { class: "row-hover",
+            on: { click: () => location.hash =
+              `#/projects/${projectSlug}/topics/${t.id}` } },
+          el("td", { style: "max-width:520px;font-weight:500" }, t.title),
+          el("td", { class: "muted", style: "font-size:13px;white-space:nowrap" },
+            t.event_date || "—"),
           el("td", {}, pill(t.status)),
           el("td", {}, el("b", {}, Number(t.score_total).toFixed(1))),
           el("td", { class: "muted", style: "font-size:12px" },
-            Object.entries(scores).map(([k, v]) => `${k}: ${v}`).join(" · ")));
+            Object.entries(scores).map(([k, v]) => `${k}: ${v}`).join(" · ")),
+          el("td", { style: "color:var(--accent);font-weight:600" }, "Открыть →"));
       }))));
 }
 
@@ -1073,6 +1100,140 @@ router.add("/projects/:pkey/channels/:ckey", async ({ pkey, ckey }) => {
   root.append(slotsEditCard);
   stamp();
 });
+
+// ============================================================================
+// Тема (по id)
+// ============================================================================
+
+router.add("/projects/:pkey/topics/:tid", async ({ pkey, tid }) => {
+  const root = $("#root");
+  root.innerHTML = "";
+  const data = await api(`/api/projects/${pkey}/topics/${tid}`);
+  const t = data.topic;
+  const project = data.project;
+  const scores = (() => { try { return JSON.parse(t.scores || "{}"); } catch { return {}; }})();
+  const sources = (() => { try { return JSON.parse(t.sources || "[]"); } catch { return []; }})();
+
+  root.append(el("div", { class: "breadcrumbs" },
+    el("a", { href: "#/projects" }, "Проекты"), " / ",
+    el("a", { href: `#/projects/${project.slug || project.id}` }, project.name), " / ",
+    el("a", { href: `#/projects/${project.slug || project.id}/tab/topics` }, "Темы"), " / ",
+    el("span", {}, t.title)));
+
+  root.append(el("div", { class: "page-title" },
+    el("div", {},
+      el("h1", { style: "margin:0;font-size:22px" }, t.title),
+      el("div", { class: "muted", style: "margin-top:4px" },
+        t.event_date ? "Дата события: " + t.event_date : "Без даты события")),
+    el("div", { class: "row" },
+      pill(t.status),
+      el("span", { class: "chip" },
+        "Рейтинг: " + Number(t.score_total).toFixed(2)))));
+
+  // Описание (расширенное summary от валидатора)
+  if (t.summary) {
+    root.append(el("div", { class: "card" },
+      el("h2", {}, "📋 Что собрала команда сбора тем"),
+      el("div", { class: "muted", style: "font-size:13px;margin-bottom:8px" },
+        "Это расширенное описание от topic_validator — что подтверждено и почему " +
+        "тема прошла фактчек."),
+      el("p", { style: "line-height:1.7" }, t.summary)));
+  }
+
+  // Оценки ранжировщика
+  if (Object.keys(scores).length) {
+    root.append(el("div", { class: "card" },
+      el("h2", {}, "📊 Как тему оценил ранжировщик"),
+      el("div", { class: "muted", style: "font-size:13px;margin-bottom:14px" },
+        "Каждый критерий 0–10. Финальный рейтинг считается локально по весам, " +
+        "которые заданы в настройках агента topic_ranker."),
+      el("div", { class: "scores-grid" },
+        ...Object.entries(scores).map(([k, v]) => el("div", { class: "score-row" },
+          el("div", { class: "score-label" }, k),
+          el("div", { class: "score-bar" },
+            el("div", { class: "score-fill",
+              style: "width:" + Math.max(0, Math.min(10, Number(v) || 0)) * 10 + "%" })),
+          el("div", { class: "score-value" }, String(v)))))));
+  }
+
+  // Источники
+  if (sources.length) {
+    root.append(el("div", { class: "card" },
+      el("h2", {}, "🔗 Источники"),
+      el("ul", { style: "margin:0;padding-left:20px;line-height:1.8" },
+        ...sources.map(s => el("li", {},
+          el("a", { href: s, target: "_blank", rel: "noopener" }, s))))));
+  }
+
+  // Статьи по этой теме
+  if (data.articles?.length) {
+    root.append(el("div", { class: "card" },
+      el("h2", {}, "✍️ Статьи по этой теме"),
+      el("table", {},
+        el("thead", {}, el("tr", {},
+          el("th", {}, "Заголовок"), el("th", {}, "Язык"),
+          el("th", {}, "Статус"), el("th", {}, "QA"),
+          el("th", {}, "Картинка"), el("th", {}, ""))),
+        el("tbody", {}, ...data.articles.map(a => el("tr", {},
+          el("td", { style: "max-width:420px" },
+            a.chosen_headline || el("span", { class: "muted" }, "—")),
+          el("td", {}, langTag(a.language)),
+          el("td", {}, pill(a.status)),
+          el("td", {}, a.qa_score || "—"),
+          el("td", {}, a.chosen_image_id
+            ? el("span", { class: "pill green" }, "есть")
+            : el("span", { class: "pill red" }, "нет")),
+          el("td", {}, el("a", {
+            href: `#/projects/${project.slug || project.id}/articles/${a.id}` },
+            "Открыть →"))))))));
+  }
+
+  // Запуски топик-фазы (генератор / валидатор / ранжировщик)
+  if (data.topic_phase_runs?.length) {
+    root.append(el("div", { class: "card" },
+      el("h2", {}, "🔍 Что собрали агенты сбора тем"),
+      el("div", { class: "muted", style: "font-size:13px;margin-bottom:14px" },
+        "Эти запуски породили эту тему вместе с другими в той же пачке. " +
+        "Можно посмотреть, что искал генератор, что подтвердил валидатор и " +
+        "как ранжировщик оценил весь набор."),
+      ...data.topic_phase_runs.map(r => agentRunBlock(r))));
+  }
+
+  // Запуски агентов по этой теме (researcher, writer, headline и т.д.)
+  if (data.agent_runs?.length) {
+    root.append(el("div", { class: "card" },
+      el("h2", {}, "🛠 Работа команды редакторов над темой"),
+      el("div", { class: "muted", style: "font-size:13px;margin-bottom:14px" },
+        "Каждый запуск — отдельный шаг команды (исследование, проверка фактов, " +
+        "написание текста, заголовков, иллюстраций, итоговый QA)."),
+      ...data.agent_runs.map(r => agentRunBlock(r))));
+  }
+  stamp();
+});
+
+function agentRunBlock(r) {
+  const inputs = (() => { try { return JSON.parse(r.inputs); } catch { return r.inputs; }})();
+  const output = (() => { try { return JSON.parse(r.output); } catch { return r.output; }})();
+  const role = ROLE_RU[r.agent_role] || r.agent_role || "агент";
+  const lang = r.agent_language && r.agent_language !== "bi"
+    ? " · " + r.agent_language.toUpperCase() : "";
+  const block = el("details", { class: "agent-run-block" },
+    el("summary", {},
+      el("span", { style: "font-weight:600" }, role + lang),
+      " ",
+      pill(r.status),
+      " ",
+      el("span", { class: "muted", style: "font-size:12px" }, fmtDate(r.started_at)),
+      r.cost_usd ? el("span", { class: "muted",
+        style: "font-size:12px;margin-left:8px" }, fmtCost(r.cost_usd)) : null),
+    el("h3", {}, "Сформированный промт"),
+    el("pre", { class: "code" }, r.rendered_prompt || ""),
+    el("h3", {}, "Что подали на вход"),
+    el("pre", { class: "code" }, JSON.stringify(inputs, null, 2)),
+    el("h3", {}, "Что вернул агент"),
+    el("pre", { class: "code" }, JSON.stringify(output, null, 2)));
+  return block;
+}
 
 // ============================================================================
 // Статья
