@@ -511,8 +511,18 @@ def _get_article(h: "AicrewHandler", p: dict[str, str]) -> None:
             h.send_json(404, {"error": "article not found"})
             return
         article = db.row_to_dict(article)
+        # Media is generated ONCE per topic and stored in media_assets with
+        # FK pointing to the FIRST article of the topic (usually RU). All
+        # sibling articles of the same topic share the same chosen_image_id
+        # but have no rows of their own in media_assets — see
+        # PipelineRunner._generate_topic_image. So we look up media by
+        # topic, not by article_id, otherwise the EN article page renders
+        # an empty gallery even though the image is correctly attached.
         media = db.rows_to_list(conn.execute(
-            "SELECT * FROM media_assets WHERE article_id=?", (p["aid"],)
+            "SELECT * FROM media_assets "
+            "WHERE article_id IN (SELECT id FROM articles WHERE topic_id=?) "
+            "ORDER BY created_at",
+            (article["topic_id"],),
         ).fetchall())
         runs = db.rows_to_list(conn.execute(
             "SELECT * FROM agent_runs WHERE article_id=? ORDER BY started_at", (p["aid"],)
