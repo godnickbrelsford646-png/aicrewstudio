@@ -170,8 +170,8 @@ class PipelineRunner:
                 rank = scored_by_title.get(title) or {}
                 conn.execute(
                     "INSERT INTO topics (id, project_id, pipeline_run_id, title, summary, sources, "
-                    "status, score_total, scores, fingerprint, created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "status, score_total, scores, fingerprint, event_date, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         db.new_id("tp_"), project_id, prid, title,
                         v.get("summary_extended", ""),
@@ -179,7 +179,15 @@ class PipelineRunner:
                         "ranked",
                         float(rank.get("score_total", 0)),
                         db.jdump(rank.get("scores", {})),
-                        fp, db.now_iso(),
+                        fp,
+                        # event_date is the exact date of the historical
+                        # event (e.g. "19 мая 1536"). It comes from the
+                        # topic_validator and is the anchor that all
+                        # downstream agents (researcher, writer, headline,
+                        # qa) re-mention so the article keeps the date in
+                        # the body and never silently drifts to "today".
+                        (v.get("event_date") or "").strip(),
+                        db.now_iso(),
                     ),
                 )
             conn.execute(
@@ -253,6 +261,15 @@ class PipelineRunner:
             "title": topic["title"],
             "summary_extended": topic.get("summary", ""),
             "sources": json.loads(topic.get("sources") or "[]"),
+            # event_date — exact date of the historical event, e.g.
+            # "19 мая 1536". Persisted on the topic by the topic phase
+            # from the topic_validator output. ALL downstream agents
+            # (researcher, research_validator, article_writer,
+            # headline_writer, qa_editorial, image_prompt_writer) read
+            # this so the article keeps the date in the body and never
+            # silently drifts to "today". Empty string for projects
+            # that don't use date anchoring.
+            "event_date": (topic.get("event_date") or "").strip(),
         }
         researcher = agents.get(("researcher", lang))
         if not researcher:
@@ -276,7 +293,7 @@ class PipelineRunner:
         headline_writer = agents.get(("headline_writer", lang))
         headlines_out = self.executor.run(
             agent=headline_writer, pipeline_run_id=prid, topic_id=topic["id"],
-            inputs={"article": article_out, "language": lang},
+            inputs={"article": article_out, "topic": topic_inputs, "language": lang},
         ).output
         article_id = db.new_id("ar_")
         with db.connect(self.settings.db_path) as conn:
@@ -296,7 +313,7 @@ class PipelineRunner:
         qa_out = self.executor.run(
             agent=qa_ed, pipeline_run_id=prid, article_id=article_id,
             inputs={"article": article_out, "headlines": headlines_out.get("headlines", []),
-                    "language": lang},
+                    "topic": topic_inputs, "language": lang},
         ).output
         with db.connect(self.settings.db_path) as conn:
             conn.execute(
@@ -330,6 +347,14 @@ class PipelineRunner:
         articles.chosen_image_id row of this topic.
         """
         first_article_id, first_lang, first_article_out = written[0]
+        # Build a topic_inputs dict identical to what _write_article_text
+        # passes to per-language agents, so image agents get event_date.
+        topic_inputs = {
+            "title": topic["title"],
+            "summary_extended": topic.get("summary", ""),
+            "sources": json.loads(topic.get("sources") or "[]"),
+            "event_date": (topic.get("event_date") or "").strip(),
+        }
         # image_prompt_writer is GLOBAL_ROLES (language-neutral) — one
         # instance per project, language='bi'. Falls back to the per-language
         # variant for older DBs that still have language='ru'/'en' rows.
@@ -341,7 +366,8 @@ class PipelineRunner:
             return
         prompts_out = self.executor.run(
             agent=ipw, pipeline_run_id=prid, topic_id=topic["id"],
-            inputs={"article": first_article_out, "language": first_lang},
+            inputs={"article": first_article_out, "topic": topic_inputs,
+                    "language": first_lang},
         ).output
         ipw_params = json.loads(ipw["params"]) if isinstance(ipw["params"], str) else (ipw["params"] or {})
         image_model = ipw_params.get("image_model", "mock:placeholder") or "mock:placeholder"
@@ -382,7 +408,7 @@ class PipelineRunner:
             visual_out = self.executor.run(
                 agent=qa_vi, pipeline_run_id=prid, article_id=first_article_id,
                 inputs={"article": first_article_out, "image_options": media_assets,
-                        "language": first_lang},
+                        "topic": topic_inputs, "language": first_lang},
             ).output
             chosen_idx = max(0, min(len(media_assets) - 1, int(visual_out.get("chosen_index", 0))))
         chosen_image_id = media_assets[chosen_idx]["id"]

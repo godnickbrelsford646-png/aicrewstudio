@@ -135,6 +135,7 @@ CREATE TABLE IF NOT EXISTS topics (
     score_total     REAL NOT NULL DEFAULT 0,
     scores          TEXT NOT NULL DEFAULT '{}',
     fingerprint     TEXT NOT NULL,
+    event_date      TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_topics_project_status ON topics(project_id, status);
@@ -263,6 +264,17 @@ def init_schema(db_path: str) -> None:
             cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if col not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        # Soft migration: topics.event_date for date-anchored projects
+        # (e.g. «Задним числом»). Older DBs created before this column
+        # existed get it backfilled with empty string. The pipeline reads
+        # event_date from the topic_validator output and writes it here so
+        # researcher / writer / headline / qa agents can re-anchor to the
+        # exact event date downstream.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(topics)").fetchall()]
+        if "event_date" not in cols:
+            conn.execute(
+                "ALTER TABLE topics ADD COLUMN event_date TEXT NOT NULL DEFAULT ''"
+            )
 
 
 # --------------------------------------------------------------------- slug --
