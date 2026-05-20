@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aicrew"
+version = "0.1.0"
+description = "AiCrewStudio MVP (offline stdlib-only build)"
+requires-python = ">=3.12"
+# NOTE: keep the production layer dependency-free so the sandbox can run it
+# without network. When pypi access is available, swap http.server for
+# FastAPI and sqlite3 for asyncpg+SQLAlchemy without changing module shape.
+dependencies = []
+
+[project.optional-dependencies]
+prod = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.30",
+  "sqlalchemy>=2",
+  "alembic>=1.13",
+  "pydantic>=2",
+  "pydantic-settings>=2",
+  "jinja2>=3.1",
+  "httpx>=0.27",
+  "cryptography>=42",
+]
+
+[project.scripts]
+aicrew = "aicrew.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aicrew*"]
