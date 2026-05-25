@@ -1059,7 +1059,7 @@ router.add("/projects/:pkey/channels/:ckey", async ({ pkey, ckey }) => {
   const data = await api(`/api/projects/${pkey}/channels/${ckey}`);
   const c = data.channel; const spec = data.spec; const project = data.project;
   const meta = CHANNEL_RU[c.kind] || { label: c.kind };
-  const pipelineAgents = data.pipeline_agents || {};
+  const rewriter = data.rewriter_agent;
 
   root.append(el("div", { class: "breadcrumbs" },
     el("a", { href: "#/projects" }, "Проекты"), " / ",
@@ -1083,63 +1083,39 @@ router.add("/projects/:pkey/channels/:ckey", async ({ pkey, ckey }) => {
   root.append(el("div", { class: "guide-box markdown",
     html: "<h3>Как подключить канал</h3>" + renderMarkdown(spec.connect_guide_md) }));
 
-  // --- Команда этого канала: 4 группы агентов с быстрым переходом ---
-  // Сюда попадают все агенты, которые участвуют в производстве поста для
-  // данного канала: rewriter (свой), редакторская команда (по языку
-  // канала), команда сбора тем (общая), визуальная команда (общая).
-  const teamCard = el("div", { class: "card" },
-    el("h2", {}, "🤖 Команда этого канала"),
-    el("div", { class: "muted",
-      style: "font-size:13px;margin-bottom:14px;line-height:1.5" },
-      "Эти агенты работают вместе, чтобы получить пост для «" +
-      c.name + "». Кликни — попадёшь в карточку агента с его промтом и " +
-      "настройками."));
-  function teamGroup(title, subtitle, agents) {
-    if (!agents || !agents.length) return null;
-    const grid = el("div", { class: "grid grid-2",
-      style: "margin-top:10px;gap:8px" });
-    for (const ag of agents) {
-      const slug = ag.slug || ag.id;
-      // Per-channel rewriter has display_name "Адаптер — <channel>";
-      // for shared roles ROLE_RU is the canonical label.
-      const headline = (ag.role === "channel_rewriter" && ag.display_name)
-        ? ag.display_name
-        : (ROLE_RU[ag.role] || ag.display_name);
-      grid.append(el("a", {
+  // --- Адаптер канала (channel_rewriter) — единственный агент, привязанный
+  // именно к этому каналу. Остальные агенты (редакторская команда, сбор
+  // тем, визуальная команда) — общие на проект, и видны на вкладке
+  // «Агенты». Здесь показываем только rewriter, чтобы не дублировать.
+  if (rewriter) {
+    const slug = rewriter.slug || rewriter.id;
+    root.append(el("div", { class: "card" },
+      el("h2", {}, "🤖 Адаптер канала"),
+      el("div", { class: "muted",
+        style: "font-size:13px;margin-bottom:14px;line-height:1.5" },
+        "Этот агент отвечает только за этот канал. Он берёт универсальную " +
+        "статью и переписывает её под формат «" + meta.label + "» " +
+        "(длина, голос, хэштеги). Промт у него уникальный, под этот канал."),
+      el("a", {
         href: `#/projects/${project.slug || project.id}/agents/${slug}`,
         class: "agent-mini",
-        style: "text-decoration:none;color:inherit" },
+        style: "text-decoration:none;color:inherit;display:block" },
         el("div", { class: "agent-mini-row" },
-          el("div", { style: "font-weight:600;font-size:14px" }, headline),
-          el("div", { class: "row" }, langTag(ag.language))),
+          el("div", { style: "font-weight:600;font-size:15px" },
+            rewriter.display_name || "Адаптер канала"),
+          el("div", { class: "row" }, langTag(rewriter.language))),
         el("div", { class: "muted", style: "font-size:12px;margin-top:4px" },
-          el("code", { class: "inline" }, ag.model)),
-        el("div", { style: "color:var(--accent);font-size:12px;" +
-                          "margin-top:4px;font-weight:600" },
-          "открыть промт →")));
-    }
-    return el("div", { style: "margin-top:14px" },
-      el("div", { style: "font-weight:600;font-size:14px" }, title),
-      el("div", { class: "muted", style: "font-size:12px" }, subtitle),
-      grid);
+          "Модель: ", el("code", { class: "inline" }, rewriter.model)),
+        el("div", { style: "color:var(--accent);font-size:13px;" +
+                          "margin-top:6px;font-weight:600" },
+          "Открыть промт и настройки →"))));
+  } else if (!c.is_video) {
+    // Текстовый канал без rewriter — что-то не так со сидом.
+    root.append(el("div", { class: "card" },
+      el("h2", {}, "🤖 Адаптер канала"),
+      el("div", { class: "muted" },
+        "Адаптер для этого канала не найден. Возможно, нужно пересоздать проект.")));
   }
-  const groups = [
-    teamGroup("Адаптер канала",
-      "переписывает универсальную статью в пост под этот канал",
-      pipelineAgents.rewriter),
-    teamGroup("Редакторская команда " +
-      (c.language === "ru" ? "(русская)" : "(английская)"),
-      "пишет универсальную статью на языке канала",
-      pipelineAgents.editorial_team),
-    teamGroup("Сбор тем (общий)",
-      "ищет события дня и ранжирует их — общий на весь проект",
-      pipelineAgents.topic_team),
-    teamGroup("Визуальная команда (общая)",
-      "пишет промт для иллюстрации и выбирает лучший вариант",
-      pipelineAgents.media_team),
-  ].filter(Boolean);
-  groups.forEach(g => teamCard.append(g));
-  root.append(teamCard);
 
   // Доступы
   const fields = spec.credentials_fields;
