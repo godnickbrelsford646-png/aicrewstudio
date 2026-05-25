@@ -23,6 +23,7 @@ from .crypto import decrypt
 from .llm.adapter import get_adapter
 from .logging_setup import set_pipeline_run
 from .publishers import get_publisher
+from .scheduler import next_slot_utc, _utc_iso, publish_due_posts
 from .settings import Settings
 from .tools.image_gen import generate_image
 
@@ -479,16 +480,51 @@ class PipelineRunner:
 
     # ---------------- publication phase ----------------------------------
 
-    def run_publication_phase(self, project_id: str, *, dry_run: bool = False) -> dict[str, int]:
-        """For every (article, channel) pair create a Post and publish via adapter.
+    def run_publication_phase(self, project_id: str, *,
+                              dry_run: bool = False,
+                              publish_immediately: bool = False
+                              ) -> dict[str, int]:
+        """Plan upcoming publications and enqueue them with ``scheduled_for``.
 
-        In production this is split: a scheduler enqueues posts for their slots.
-        Here we synchronously publish so the demo shows results in one shot.
+        This is the slot-aware replacement for the old "publish now"
+        flow. For each active text channel of the project we:
+
+          1. Look up ``channel_slots`` (enabled rows). Each slot is an
+             "HH:MM" in ``project.timezone`` — convert to the next
+             future UTC moment using zoneinfo. If the channel has no
+             slots, fall back to ``posts_per_day`` evenly distributed
+             over the day so old projects don't break.
+
+          2. Pick articles by ``selection_strategy`` (``by_rank`` or
+             ``random_among_written``), excluding any (article, channel)
+             pair already in ``posts`` (UNIQUE constraint guards us
+             too, but checking up front avoids wasting LLM calls on
+             the rewriter).
+
+          3. For each (article, slot) pair, run the channel rewriter
+             (so the per-channel body is ready to publish) and INSERT
+             a ``posts`` row with ``status='scheduled'`` and
+             ``scheduled_for``. The background scheduler thread will
+             pick the row up at the appointed moment.
+
+        ``publish_immediately=True`` skips the slot calculation, sets
+        ``scheduled_for=now``, and synchronously runs one tick of
+        ``publish_due_posts`` so the user sees results in one shot.
+        Useful for the "Полный цикл (опубликовать сейчас)" smoke-test
+        button. Default is False — proper scheduled mode.
+
+        ``dry_run=True`` plans the posts (creates ``status='scheduled'``
+        rows) but does not run a synchronous publish tick. Same as the
+        default mode, kept for backward compat.
         """
-
         with db.connect(self.settings.db_path) as conn:
+            project_row = conn.execute(
+                "SELECT timezone FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            tz_name = (project_row["timezone"] if project_row else "UTC") or "UTC"
             channels = db.rows_to_list(conn.execute(
-                "SELECT * FROM channels WHERE project_id=? AND is_enabled=1", (project_id,)
+                "SELECT * FROM channels WHERE project_id=? AND is_enabled=1",
+                (project_id,),
             ).fetchall())
             articles = db.rows_to_list(conn.execute(
                 "SELECT * FROM articles WHERE project_id=? AND status='qa_passed' "
@@ -497,30 +533,38 @@ class PipelineRunner:
             agents = _agents_by_role(conn, project_id)
         prid = self._start_pipeline_run(project_id, "publication")
         posts_created = 0
-        posts_published = 0
         for ch in channels:
             spec = CHANNEL_KINDS[ch["kind"]]
             lang_articles = [a for a in articles if a["language"] == ch["language"]]
             if not lang_articles:
                 continue
-            # respect daily budget per channel: posts_per_day caps how many we publish now
-            cap = max(1, int(ch["posts_per_day"]))
-            # selection strategy
+            slot_times = self._upcoming_slots_utc(
+                ch["id"], tz_name,
+                fallback_count=max(1, int(ch["posts_per_day"])),
+                publish_immediately=publish_immediately,
+            )
+            if not slot_times:
+                continue
+            # selection strategy: order articles, then take as many as
+            # we have slots, skipping ones already posted to this channel.
             if ch["selection_strategy"] == "random_among_written":
                 pool = sorted(lang_articles, key=lambda a: a["id"])
             else:
-                # by_rank requires topic score; use a join-like approach
                 with db.connect(self.settings.db_path) as conn:
                     scored = []
                     for a in lang_articles:
-                        t = conn.execute("SELECT score_total FROM topics WHERE id=?",
-                                         (a["topic_id"],)).fetchone()
+                        t = conn.execute(
+                            "SELECT score_total FROM topics WHERE id=?",
+                            (a["topic_id"],),
+                        ).fetchone()
                         scored.append((float(t["score_total"]) if t else 0.0, a))
-                pool = [a for _, a in sorted(scored, key=lambda x: x[0], reverse=True)]
-            # exclude articles already posted to this channel
-            taken = 0
+                pool = [a for _, a in sorted(scored, key=lambda x: x[0],
+                                              reverse=True)]
+            slot_iter = iter(slot_times)
             for a in pool:
-                if taken >= cap:
+                try:
+                    slot_dt = next(slot_iter)
+                except StopIteration:
                     break
                 with db.connect(self.settings.db_path) as conn:
                     exists = conn.execute(
@@ -528,96 +572,125 @@ class PipelineRunner:
                         (a["id"], ch["id"]),
                     ).fetchone()
                 if exists:
+                    # Article already queued/published for this channel;
+                    # we still consumed a slot iteration step? No — we
+                    # didn't, we just skip this article and try the
+                    # next one for the same slot. Push the slot back.
+                    slot_iter = iter([slot_dt, *slot_iter])  # type: ignore[arg-type]
                     continue
                 if spec.is_video:
-                    # video pipeline not yet generating final video assets; skip in MVP
                     body = ""
                     headline = a["chosen_headline"]
                     image_id = None
                 else:
-                    rewriter_inputs = {
-                        "article": {
-                            "body_md": a["body_full"],
-                            "title_working": a["chosen_headline"] or "",
-                        },
-                        "channel": {
-                            "name": ch["name"], "kind": ch["kind"],
-                            "max_chars": spec.max_chars,
-                        },
-                        "language": ch["language"],
-                    }
-                    rewriter_agent = None
-                    if ch.get("rewriter_agent_id"):
-                        with db.connect(self.settings.db_path) as conn:
-                            row = conn.execute(
-                                "SELECT * FROM agents WHERE id=?",
-                                (ch["rewriter_agent_id"],),
-                            ).fetchone()
-                            rewriter_agent = db.row_to_dict(row)
-                    if rewriter_agent is None:
-                        # fall back to project-level prototype if any
-                        rewriter_agent = agents.get(("channel_rewriter", "bi")) \
-                                         or agents.get(("channel_rewriter", ch["language"]))
-                    if rewriter_agent is None:
-                        # last resort: use raw body trimmed
-                        body = a["body_full"][: spec.max_chars]
-                    else:
-                        rew_out = self.executor.run(
-                            agent=rewriter_agent, pipeline_run_id=prid, article_id=a["id"],
-                            inputs=rewriter_inputs,
-                        ).output
-                        body = rew_out.get("post_body", "")
-                    headline = a["chosen_headline"]
-                    image_id = a["chosen_image_id"]
+                    body, headline, image_id = self._rewrite_for_channel(
+                        prid, agents, ch, spec, a)
                 post_id = db.new_id("po_")
                 with db.connect(self.settings.db_path) as conn:
                     conn.execute(
-                        "INSERT INTO posts (id, article_id, channel_id, body, headline, "
-                        "image_asset_id, status, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                        (post_id, a["id"], ch["id"], body, headline, image_id, "scheduled",
+                        "INSERT INTO posts (id, article_id, channel_id, body, "
+                        "headline, image_asset_id, status, scheduled_for, "
+                        "created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (post_id, a["id"], ch["id"], body, headline,
+                         image_id, "scheduled", _utc_iso(slot_dt),
                          db.now_iso()),
                     )
                 posts_created += 1
-                taken += 1
-                if dry_run:
-                    continue
-                # publish via adapter (mock by default)
-                creds = self._channel_creds(ch)
-                publisher = get_publisher(ch["kind"])
-                try:
-                    res = publisher.publish(
-                        post={"id": post_id, "body": body, "headline": headline,
-                              "image_asset_id": image_id, "language": ch["language"]},
-                        creds=creds, settings=self.settings,
-                    )
-                    with db.connect(self.settings.db_path) as conn:
-                        if res.ok:
-                            conn.execute(
-                                "UPDATE posts SET status='published', published_at=?, "
-                                "external_url=?, provider_meta=? WHERE id=?",
-                                (db.now_iso(), res.external_url,
-                                 db.jdump(res.raw_response), post_id),
-                            )
-                            posts_published += 1
-                        else:
-                            conn.execute(
-                                "UPDATE posts SET status='failed', error=?, provider_meta=? WHERE id=?",
-                                (res.error or "unknown", db.jdump(res.raw_response), post_id),
-                            )
-                except Exception as exc:
-                    with db.connect(self.settings.db_path) as conn:
-                        conn.execute(
-                            "UPDATE posts SET status='failed', error=? WHERE id=?",
-                            (repr(exc), post_id),
-                        )
-            # mark articles as published once at least one channel succeeded
         with db.connect(self.settings.db_path) as conn:
             conn.execute(
                 "UPDATE pipeline_runs SET status=?, finished_at=? WHERE id=?",
                 ("completed", db.now_iso(), prid),
             )
-        return {"posts_created": posts_created, "posts_published": posts_published,
+        posts_published = 0
+        if publish_immediately and not dry_run:
+            # One synchronous tick so the user sees published rows in
+            # the same request. The scheduler thread would do it on
+            # its next tick anyway; this just makes the demo snappy.
+            posts_published = publish_due_posts(self.settings)
+        return {"posts_created": posts_created,
+                "posts_published": posts_published,
                 "pipeline_run_id": prid}
+
+    def _upcoming_slots_utc(self, channel_id: str, tz_name: str,
+                            *, fallback_count: int,
+                            publish_immediately: bool) -> list:
+        """List of next-occurrence UTC datetimes for this channel's slots.
+
+        Reads enabled rows from ``channel_slots`` and converts each
+        ``time_local`` to the next future UTC moment in the project's
+        timezone. Falls back to ``fallback_count`` evenly-spaced
+        moments today if the channel has no slots configured (so old
+        projects keep working).
+
+        When ``publish_immediately=True`` we ignore slots entirely
+        and return ``fallback_count`` copies of "right now". This is
+        the smoke-test path; the scheduler will fire them at the
+        next tick or the synchronous tick at the end of
+        ``run_publication_phase`` will do it in this request.
+        """
+        from datetime import datetime, timezone, timedelta
+        if publish_immediately:
+            now = datetime.now(timezone.utc)
+            return [now for _ in range(max(1, fallback_count))]
+        with db.connect(self.settings.db_path) as conn:
+            slots = db.rows_to_list(conn.execute(
+                "SELECT time_local FROM channel_slots "
+                "WHERE channel_id=? AND enabled=1 ORDER BY time_local",
+                (channel_id,),
+            ).fetchall())
+        if slots:
+            return [next_slot_utc(s["time_local"], tz_name) for s in slots]
+        # No explicit slots — synthesize fallback_count moments
+        # spread across the next 24 h starting an hour from now. Old
+        # behaviour was "publish all immediately"; this is the
+        # gentlest replacement.
+        now = datetime.now(timezone.utc)
+        step = timedelta(hours=max(1, 24 // max(1, fallback_count)))
+        return [now + step * (i + 1) for i in range(fallback_count)]
+
+    def _rewrite_for_channel(self, prid: str, agents: dict, ch: dict,
+                             spec, article: dict) -> tuple[str, str, str | None]:
+        """Run the per-channel rewriter and return (body, headline, image_id).
+
+        Extracted from the old run_publication_phase so enqueueing can
+        happen ahead of the slot. The rewriter call is the expensive
+        part (one LLM round-trip per channel) — we make it once here
+        and store the rendered body in ``posts.body`` so the scheduler
+        only does the network call to the channel API at fire time.
+        """
+        rewriter_inputs = {
+            "article": {
+                "body_md": article["body_full"],
+                "title_working": article["chosen_headline"] or "",
+            },
+            "channel": {
+                "name": ch["name"], "kind": ch["kind"],
+                "max_chars": spec.max_chars,
+            },
+            "language": ch["language"],
+        }
+        rewriter_agent = None
+        if ch.get("rewriter_agent_id"):
+            with db.connect(self.settings.db_path) as conn:
+                row = conn.execute(
+                    "SELECT * FROM agents WHERE id=?",
+                    (ch["rewriter_agent_id"],),
+                ).fetchone()
+                if row:
+                    rewriter_agent = db.row_to_dict(row)
+        if rewriter_agent is None:
+            rewriter_agent = (agents.get(("channel_rewriter", "bi"))
+                              or agents.get(("channel_rewriter", ch["language"])))
+        if rewriter_agent is None:
+            body = article["body_full"][: spec.max_chars]
+        else:
+            rew_out = self.executor.run(
+                agent=rewriter_agent, pipeline_run_id=prid,
+                article_id=article["id"], inputs=rewriter_inputs,
+            ).output
+            body = rew_out.get("post_body", "")
+        return body, article["chosen_headline"], article["chosen_image_id"]
+
 
     # ---------------- helpers --------------------------------------------
 

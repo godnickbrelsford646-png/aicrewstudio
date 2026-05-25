@@ -22,6 +22,11 @@ from .agents.param_schema import schema_payload
 from .channels.registry import CHANNEL_KINDS, list_kinds
 from .crypto import decrypt, encrypt, mask
 from .pipeline import PipelineRunner
+from .scheduler import (
+    now_utc_iso,
+    publish_one_post,
+    start_scheduler,
+)
 from .settings import Settings, load_settings
 
 log = logging.getLogger("aicrew.api")
@@ -491,6 +496,36 @@ def _list_posts(h: "AicrewHandler", p: dict[str, str]) -> None:
     h.send_json(200, {"posts": rows})
 
 
+@route("POST", "/api/posts/{post_id}/publish_now")
+def _publish_now(h: "AicrewHandler", p: dict[str, str]) -> None:
+    """Publish an existing scheduled post immediately, ignoring its slot.
+
+    Resets ``scheduled_for`` to now, zeros ``attempts`` (so the manual
+    click gets a fresh retry budget — useful when a post has hit
+    ``status='failed'`` after MAX_ATTEMPTS and the user wants to retry
+    after fixing whatever caused the failure), then synchronously
+    invokes the publisher.
+    """
+    post_id = p["post_id"]
+    with db.connect(h.settings.db_path) as conn:
+        row = conn.execute(
+            "SELECT id, status FROM posts WHERE id=?", (post_id,),
+        ).fetchone()
+        if not row:
+            h.send_json(404, {"error": "post not found"})
+            return
+        # Force the post into 'scheduled' state (it might be 'failed'
+        # after MAX_ATTEMPTS) and reset attempts so the manual click
+        # gets a fresh retry budget.
+        conn.execute(
+            "UPDATE posts SET status='scheduled', scheduled_for=?, "
+            "attempts=0, last_attempt_at=NULL, error=NULL WHERE id=?",
+            (now_utc_iso(), post_id),
+        )
+    ok = publish_one_post(post_id, h.settings)
+    h.send_json(200, {"ok": ok})
+
+
 @route("GET", "/api/projects/{pkey}/topics/{tid}")
 def _get_topic(h: "AicrewHandler", p: dict[str, str]) -> None:
     """Topic detail page. Returns:
@@ -591,11 +626,161 @@ def _get_article(h: "AicrewHandler", p: dict[str, str]) -> None:
         topic = conn.execute(
             "SELECT * FROM topics WHERE id=?", (article["topic_id"],)
         ).fetchone()
+        # Channels of this project that match the article's language.
+        # The article page uses this to render a "publish to channel"
+        # panel — we only show channels with matching language because
+        # a Russian-only article has nothing useful to send to an
+        # English Telegram channel.
+        project_channels = db.rows_to_list(conn.execute(
+            "SELECT id, slug, kind, name, language, is_video, credentials_enc "
+            "FROM channels WHERE project_id=? AND is_enabled=1 AND language=? "
+            "ORDER BY name",
+            (project["id"], article["language"]),
+        ).fetchall())
+        # Existing posts for this article across all channels. UI uses
+        # this to show "уже опубликовано / запланировано / упало" inline
+        # next to each channel button instead of the bare "Опубликовать
+        # сейчас" CTA.
+        art_posts = db.rows_to_list(conn.execute(
+            "SELECT po.id, po.channel_id, po.status, po.scheduled_for, "
+            "po.published_at, po.external_url, po.error, po.attempts, "
+            "ch.name AS channel_name, ch.kind AS channel_kind, "
+            "ch.slug AS channel_slug "
+            "FROM posts po JOIN channels ch ON ch.id=po.channel_id "
+            "WHERE po.article_id=?",
+            (p["aid"],),
+        ).fetchall())
+    # Flag connected channels and strip the encrypted blob — same logic
+    # as _get_project, kept duplicated rather than factored out so the
+    # surface for accidental leaks of credentials_enc to the wire stays
+    # very small and grepable.
+    for ch in project_channels:
+        enc = (ch.pop("credentials_enc", "") or "").strip()
+        connected = False
+        if enc:
+            try:
+                raw = json.loads(decrypt(enc, h.settings.master_key))
+                connected = bool(raw) and any(
+                    str(v).strip() for v in raw.values() if v is not None
+                )
+            except Exception:
+                connected = False
+        ch["is_connected"] = connected
     h.send_json(200, {
         "project": {"id": project["id"], "slug": project["slug"], "name": project["name"]},
         "article": article, "media": media, "agent_runs": runs,
         "topic": db.row_to_dict(topic),
+        "channels": project_channels, "posts": art_posts,
     })
+
+
+@route("POST", "/api/projects/{pkey}/articles/{aid}/publish/{ckey}")
+def _publish_article_to_channel(h: "AicrewHandler", p: dict[str, str]) -> None:
+    """One-click "publish this article to this channel right now".
+
+    Used from the article detail page where the user sees a list of
+    connected channels and clicks "Опубликовать в Telegram". The flow:
+
+      1. Resolve project + channel + article, ensure the channel has
+         real credentials (avoids creating a post that will instantly
+         fail on the first tick).
+      2. Find or create the (article, channel) post. If new, run the
+         channel rewriter once so ``posts.body`` holds the
+         channel-adapted text — same path the slot-aware scheduler
+         takes, just compressed into one synchronous call.
+      3. Force ``scheduled_for=now`` and synchronously fire
+         publish_one_post.
+
+    Idempotent: a second click won't create a duplicate post (UNIQUE
+    constraint on (article_id, channel_id)) — it just resets the row
+    and retries, which is exactly what the user expects when the first
+    attempt failed.
+    """
+    project = _resolve_project(h, p["pkey"])
+    if project is None:
+        return
+    channel = _resolve_channel(h, project["id"], p["ckey"])
+    if channel is None:
+        return
+    # Verify the channel actually has credentials. Same is_connected
+    # check as _get_project / _get_article — see those for rationale
+    # (seed.py writes encrypted empty dicts for fresh channels).
+    enc = (channel.get("credentials_enc") or "").strip()
+    is_connected = False
+    if enc:
+        try:
+            raw = json.loads(decrypt(enc, h.settings.master_key))
+            is_connected = bool(raw) and any(
+                str(v).strip() for v in raw.values() if v is not None
+            )
+        except Exception:
+            is_connected = False
+    if not is_connected:
+        h.send_json(400, {"error": "channel is not connected (no credentials)"})
+        return
+    with db.connect(h.settings.db_path) as conn:
+        article_row = conn.execute(
+            "SELECT * FROM articles WHERE id=? AND project_id=?",
+            (p["aid"], project["id"]),
+        ).fetchone()
+        if not article_row:
+            h.send_json(404, {"error": "article not found"})
+            return
+        article = db.row_to_dict(article_row)
+        existing_post = conn.execute(
+            "SELECT id FROM posts WHERE article_id=? AND channel_id=?",
+            (p["aid"], channel["id"]),
+        ).fetchone()
+    runner = PipelineRunner(h.settings)
+    spec = CHANNEL_KINDS[channel["kind"]]
+    if existing_post:
+        post_id = existing_post["id"]
+        # Reset the existing post so the user can re-publish (e.g. if
+        # the previous attempt failed). We do NOT re-run the rewriter
+        # here on the assumption the existing body is good; if the user
+        # wants a fresh rewrite they can delete the post first.
+        with db.connect(h.settings.db_path) as conn:
+            conn.execute(
+                "UPDATE posts SET status='scheduled', scheduled_for=?, "
+                "attempts=0, last_attempt_at=NULL, error=NULL WHERE id=?",
+                (now_utc_iso(), post_id),
+            )
+    else:
+        # Fresh post: run the channel rewriter so body is adapted to
+        # the channel format (Telegram tone is different from VK tone,
+        # and definitely different from a tweet's char limit).
+        with db.connect(h.settings.db_path) as conn:
+            agents: dict[tuple[str, str], dict[str, Any]] = {}
+            for r in conn.execute(
+                "SELECT * FROM agents WHERE project_id=? AND is_enabled=1",
+                (project["id"],),
+            ).fetchall():
+                d = db.row_to_dict(r) or {}
+                agents[(d["role"], d.get("language") or "bi")] = d
+        prid = runner.create_pipeline_run(project["id"], kind="publication")
+        if spec.is_video:
+            # Video channels don't have a text rewriter today — just
+            # carry the headline. Real video rendering is a separate
+            # feature (see docs/07-video-team.md).
+            body, headline, image_id = "", article["chosen_headline"], None
+        else:
+            body, headline, image_id = runner._rewrite_for_channel(
+                prid, agents, channel, spec, article)
+        post_id = db.new_id("po_")
+        with db.connect(h.settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO posts (id, article_id, channel_id, body, headline, "
+                "image_asset_id, status, scheduled_for, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (post_id, p["aid"], channel["id"], body, headline, image_id,
+                 "scheduled", now_utc_iso(), db.now_iso()),
+            )
+            conn.execute(
+                "UPDATE pipeline_runs SET status='completed', finished_at=? WHERE id=?",
+                (db.now_iso(), prid),
+            )
+    ok = publish_one_post(post_id, h.settings)
+    h.send_json(200, {"ok": ok, "post_id": post_id})
 
 
 # --------------------------------------------------------------- handler ---
@@ -715,9 +900,21 @@ class AicrewHandler(BaseHTTPRequestHandler):
 def serve(settings: Settings | None = None) -> None:
     settings = settings or load_settings()
     AicrewHandler.settings = settings
+    # Critical: ensure schema is up to date before the scheduler thread
+    # starts touching `posts`. The scheduler reads attempts/last_attempt_at,
+    # which are added by soft-migration in init_schema; without this call
+    # an old DB created before the scheduler existed would crash the very
+    # first tick. Cheap to call when the schema is already current.
+    db.init_schema(settings.db_path)
     server = ThreadingHTTPServer(("0.0.0.0", settings.port), AicrewHandler)
     log.warning("serving on http://0.0.0.0:%d (db=%s, llm=%s)",
                 settings.port, settings.db_path, settings.llm_provider)
+    # Background publication scheduler. Daemon thread, idempotent across
+    # double-calls, ticks every TICK_SECONDS picking due posts and
+    # publishing them through the channel adapter. Started here (not at
+    # module import) so unit tests that import api.py do not spin up a
+    # background thread that would race with their tearDown.
+    start_scheduler(settings)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

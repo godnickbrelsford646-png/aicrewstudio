@@ -275,6 +275,19 @@ def init_schema(db_path: str) -> None:
             conn.execute(
                 "ALTER TABLE topics ADD COLUMN event_date TEXT NOT NULL DEFAULT ''"
             )
+        # Soft migration: posts.attempts / posts.last_attempt_at for the
+        # background scheduler. The scheduler retries failed publications
+        # with exponential backoff up to MAX_PUBLISH_ATTEMPTS times; we
+        # need a counter and a timestamp to compute the next eligible
+        # retry. Older DBs created before the scheduler was added get
+        # these columns backfilled here.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(posts)").fetchall()]
+        if "attempts" not in cols:
+            conn.execute(
+                "ALTER TABLE posts ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_attempt_at" not in cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN last_attempt_at TEXT")
 
 
 # --------------------------------------------------------------------- slug --

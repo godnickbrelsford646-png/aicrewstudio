@@ -402,5 +402,40 @@ class WanAsyncFlowTest(unittest.TestCase):
         self.assertIn("302ai:wan2.7-image", err_content)
 
 
+class SchedulerTimeTest(unittest.TestCase):
+    """slot 'HH:MM' + project timezone → next future UTC datetime."""
+
+    def test_next_slot_utc_today_in_future(self) -> None:
+        from datetime import datetime, timezone
+        from aicrew.scheduler import next_slot_utc
+        # Now = 2026-05-25 06:00 UTC = 09:00 Europe/Moscow
+        # Slot 12:00 МСК → 12:00 МСК сегодня = 09:00 UTC сегодня
+        now = datetime(2026, 5, 25, 6, 0, tzinfo=timezone.utc)
+        out = next_slot_utc("12:00", "Europe/Moscow", now_utc=now)
+        self.assertEqual(out.year, 2026)
+        self.assertEqual(out.month, 5)
+        self.assertEqual(out.day, 25)
+        self.assertEqual(out.hour, 9)  # 12 МСК = 09 UTC летом
+        self.assertEqual(out.minute, 0)
+
+    def test_next_slot_utc_already_passed_rolls_to_tomorrow(self) -> None:
+        from datetime import datetime, timezone
+        from aicrew.scheduler import next_slot_utc
+        # Now = 2026-05-25 15:00 UTC = 18:00 Europe/Moscow
+        # Slot 12:00 МСК уже прошёл сегодня → должен быть завтра в 12:00 МСК
+        now = datetime(2026, 5, 25, 15, 0, tzinfo=timezone.utc)
+        out = next_slot_utc("12:00", "Europe/Moscow", now_utc=now)
+        self.assertEqual(out.day, 26)
+        self.assertEqual(out.hour, 9)  # 12 МСК = 09 UTC
+
+    def test_next_slot_utc_unknown_tz_falls_back(self) -> None:
+        from datetime import datetime, timezone
+        from aicrew.scheduler import next_slot_utc
+        now = datetime(2026, 5, 25, 6, 0, tzinfo=timezone.utc)
+        out = next_slot_utc("12:00", "Bogus/Nowhere", now_utc=now)
+        # Must not crash; should fall back to UTC interpretation.
+        self.assertEqual(out.hour, 12)
+
+
 if __name__ == "__main__":
     unittest.main()

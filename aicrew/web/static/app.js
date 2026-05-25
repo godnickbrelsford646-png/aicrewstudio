@@ -568,14 +568,43 @@ function renderPostsTab(projectSlug) {
       wrap.append(emptyState("📤", "Публикаций пока нет", "Запустите фазу публикации."));
       return;
     }
+    async function publishNowRow(postId) {
+      try {
+        const resp = await api(`/api/posts/${postId}/publish_now`, { method: "POST" });
+        if (resp.ok) toast("Опубликовано");
+        else toast("Не удалось — повторим автоматически", "error");
+        setTimeout(() => location.reload(), 800);
+      } catch (e) {
+        toast("Ошибка: " + e.message, "error");
+      }
+    }
     wrap.append(el("table", {},
       el("thead", {}, el("tr", {},
         el("th", {}, "Канал"), el("th", {}, "Язык"), el("th", {}, "Статус"),
+        el("th", {}, "Когда"),
         el("th", {}, "Заголовок"), el("th", {}, "Ссылка"))),
       el("tbody", {}, ...posts.map(p => el("tr", {},
         el("td", {}, el("div", { class: "row" }, chIcon(p.channel_kind), p.channel_name)),
         el("td", {}, langTag(p.language)),
         el("td", {}, pill(p.status)),
+        // «Когда»: для опубликованных — реальное время отправки, для
+        // запланированных — scheduled_for. Под scheduled добавляем
+        // маленькую ссылку «опубликовать сейчас», которая бьёт в
+        // POST /api/posts/{id}/publish_now и принудительно отправляет
+        // пост, не дожидаясь слота. Полезно для отладки расписания.
+        el("td", { class: "muted", style: "font-size:12px;white-space:nowrap" },
+          p.status === "published"
+            ? fmtDate(p.published_at)
+            : el("div", {},
+                fmtDate(p.scheduled_for),
+                p.status === "scheduled" || p.status === "pending"
+                  ? el("div", {},
+                      el("a", { href: "#", style: "font-size:11px",
+                        on: { click: (e) => {
+                          e.preventDefault();
+                          publishNowRow(p.id);
+                        } } }, "опубликовать сейчас"))
+                  : null)),
         el("td", { style: "max-width:380px" }, p.article_headline || ""),
         el("td", {}, p.external_url
           ? el("a", { href: p.external_url, target: "_blank" }, "открыть ↗")
@@ -1434,6 +1463,82 @@ router.add("/projects/:pkey/articles/:aid", async ({ pkey, aid }) => {
         el("td", { class: "muted" }, fmtDate(r.started_at)),
         el("td", {}, pill(r.status)),
         el("td", {}, el("code", { class: "inline" }, r.agent_id))))))));
+
+  // ─── Публикация в канал ───────────────────────────────────────────────
+  // Показываем подключённые каналы того же языка, что и статья. Для
+  // каждого канала: либо кнопка «Опубликовать сейчас» (новый пост), либо
+  // статус существующего поста с кнопкой «Повторить» если он провалился.
+  // Это альтернатива слот-планировщику: пользователь, не желающий ждать
+  // расписания, кликает кнопку и пост уходит в канал немедленно (POST
+  // /api/projects/{pkey}/articles/{aid}/publish/{ckey}).
+  const connectedChannels = (data.channels || []).filter(c => c.is_connected);
+  const postsByChannel = Object.fromEntries(
+    (data.posts || []).map(p => [p.channel_id, p]));
+  const pubCard = el("div", { class: "card" },
+    el("h2", {}, "📢 Опубликовать в канал"),
+    el("div", { class: "muted", style: "font-size:12px;margin-bottom:12px" },
+      "Кликните «Опубликовать сейчас», чтобы пропустить статью через адаптер "
+      + "канала и отправить прямо сейчас, не дожидаясь слота расписания."));
+  if (!connectedChannels.length) {
+    pubCard.append(emptyState("🔌", "Подключённых каналов нет",
+      "Подключите токены в разделе «Каналы» проекта."));
+  } else {
+    const list = el("div", { class: "row gap-md", style: "flex-direction:column;align-items:stretch" });
+    for (const ch of connectedChannels) {
+      const post = postsByChannel[ch.id];
+      const left = el("div", { class: "row" }, chIcon(ch.kind),
+        el("div", {}, el("div", {}, ch.name),
+          el("div", { class: "muted", style: "font-size:12px" },
+            (CHANNEL_RU[ch.kind]?.label || ch.kind))));
+      let right;
+      if (!post) {
+        // Пост ещё не создан — показываем основную CTA.
+        right = el("button", { class: "primary",
+          on: { click: () => publishNow(ch) } }, "Опубликовать сейчас");
+      } else if (post.status === "published") {
+        right = el("div", { class: "row" }, pill("published"),
+          post.external_url
+            ? el("a", { href: post.external_url, target: "_blank" }, "открыть ↗")
+            : el("span", { class: "muted" }, "ссылка недоступна"));
+      } else if (post.status === "failed") {
+        right = el("div", { class: "row" }, pill("failed"),
+          el("span", { class: "muted",
+            style: "font-size:12px;max-width:280px;overflow:hidden;text-overflow:ellipsis" },
+            post.error || ""),
+          el("button", { class: "ghost",
+            on: { click: () => publishNow(ch) } }, "Повторить"));
+      } else {
+        // scheduled / pending — показываем когда и даём кнопку «прямо сейчас».
+        right = el("div", { class: "row" }, pill(post.status),
+          el("span", { class: "muted", style: "font-size:12px" },
+            "запланировано: " + fmtDate(post.scheduled_for)),
+          el("button", { class: "ghost",
+            on: { click: () => publishNow(ch) } }, "опубликовать сейчас"));
+      }
+      list.append(el("div", { class: "agent-mini",
+        style: "display:flex;justify-content:space-between;align-items:center" },
+        left, right));
+    }
+    pubCard.append(list);
+  }
+  async function publishNow(ch) {
+    const ckey = ch.slug || ch.id;
+    try {
+      const resp = await api(
+        `/api/projects/${project.slug || project.id}/articles/${a.id}/publish/${ckey}`,
+        { method: "POST" });
+      if (resp.ok) {
+        toast("Опубликовано в " + ch.name);
+      } else {
+        toast("Не удалось опубликовать в " + ch.name + " — повторим автоматически", "error");
+      }
+      setTimeout(() => location.reload(), 800);
+    } catch (e) {
+      toast("Ошибка: " + e.message, "error");
+    }
+  }
+  root.append(pubCard);
+
   stamp();
 });
 
