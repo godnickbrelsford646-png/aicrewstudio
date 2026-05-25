@@ -125,9 +125,17 @@ def _get_project(h: "AicrewHandler", p: dict[str, str]) -> None:
             "SELECT * FROM articles WHERE project_id=? ORDER BY created_at DESC LIMIT 50",
             (pid,),
         ).fetchall())
+        # Channels: order connected ones first (those with non-empty
+        # credentials_enc) so the user sees what's already plugged in at the
+        # top of the Channels tab. We never expose the encrypted blob to the
+        # browser — replace it with a boolean is_connected flag.
         channels = db.rows_to_list(conn.execute(
-            "SELECT * FROM channels WHERE project_id=? ORDER BY name", (pid,)
+            "SELECT * FROM channels WHERE project_id=? "
+            "ORDER BY (CASE WHEN credentials_enc <> '' THEN 0 ELSE 1 END), name",
+            (pid,),
         ).fetchall())
+        for ch in channels:
+            ch["is_connected"] = bool((ch.pop("credentials_enc", "") or "").strip())
         runs = db.rows_to_list(conn.execute(
             "SELECT * FROM pipeline_runs WHERE project_id=? ORDER BY started_at DESC LIMIT 20",
             (pid,),
@@ -320,6 +328,49 @@ def _get_channel_by_slug(h: "AicrewHandler", p: dict[str, str]) -> None:
             "SELECT * FROM channel_slots WHERE channel_id=? ORDER BY time_local",
             (channel["id"],),
         ).fetchall())
+        # Pipeline agents for this channel — every agent that participates
+        # when a post for this channel is produced. Grouped so the UI can
+        # render them as four mini-sections with quick navigation:
+        #   rewriter        — the per-channel adapter (1)
+        #   topic_team      — global topic agents (3): generator/validator/ranker
+        #   editorial_team  — language-scoped writers/QA matching this channel's
+        #                     language (researcher → article_writer → headline_writer
+        #                     → qa_editorial; plus research_validator)
+        #   media_team      — global image agents (2): image_prompt_writer,
+        #                     qa_visual
+        all_ag = db.rows_to_list(conn.execute(
+            "SELECT id, slug, role, language, display_name, model, "
+            "channel_id, is_enabled FROM agents WHERE project_id=? "
+            "ORDER BY role, language",
+            (project["id"],),
+        ).fetchall())
+    TOPIC_ROLES = {"topic_generator", "topic_validator", "topic_ranker"}
+    EDITORIAL_ROLES = {"researcher", "research_validator", "article_writer",
+                       "headline_writer", "qa_editorial"}
+    MEDIA_ROLES = {"image_prompt_writer", "qa_visual"}
+    pipeline_agents: dict[str, list[dict[str, Any]]] = {
+        "rewriter": [], "topic_team": [],
+        "editorial_team": [], "media_team": [],
+    }
+    rewriter_id = channel.get("rewriter_agent_id") or ""
+    for ag in all_ag:
+        role = ag["role"]
+        if role == "channel_rewriter":
+            # Only the rewriter assigned to THIS channel — either via
+            # channels.rewriter_agent_id (forward link) or agents.channel_id
+            # (reverse link, set in seed.py for newly-created rewriters).
+            if ag["id"] == rewriter_id or ag.get("channel_id") == channel["id"]:
+                pipeline_agents["rewriter"].append(ag)
+        elif role in TOPIC_ROLES:
+            pipeline_agents["topic_team"].append(ag)
+        elif role in EDITORIAL_ROLES:
+            # Match the channel's language. Editorial agents are language-
+            # scoped (LANG_SCOPED_ROLES), so we only include the team that
+            # actually writes in this channel's language.
+            if (ag.get("language") or "") == channel["language"]:
+                pipeline_agents["editorial_team"].append(ag)
+        elif role in MEDIA_ROLES:
+            pipeline_agents["media_team"].append(ag)
     creds_masked: dict[str, str] = {}
     if channel.get("credentials_enc"):
         try:
@@ -328,11 +379,17 @@ def _get_channel_by_slug(h: "AicrewHandler", p: dict[str, str]) -> None:
         except Exception:
             pass
     channel["credentials_masked"] = creds_masked
+    channel["is_connected"] = bool((channel.get("credentials_enc") or "").strip())
     channel.pop("credentials_enc", None)
     h.send_json(200, {
-        "project": {"id": project["id"], "slug": project["slug"], "name": project["name"]},
+        "project": {"id": project["id"], "slug": project["slug"],
+                    "name": project["name"],
+                    # Surface timezone so the channel page can label slot
+                    # times correctly ("local time of project, timezone=...").
+                    "timezone": project.get("timezone") or "UTC"},
         "channel": channel, "slots": slots,
         "spec": _kind_payload(channel["kind"]),
+        "pipeline_agents": pipeline_agents,
     })
 
 

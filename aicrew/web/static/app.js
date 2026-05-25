@@ -506,11 +506,16 @@ function renderArticlesTab(projectSlug, articles) {
 function renderChannelsTab(projectSlug, channels) {
   if (!channels.length)
     return emptyState("📡", "Каналов пока нет", "Каналы добавляются через seed или вручную.");
-  const wrap = el("div", { class: "grid grid-2" });
-  for (const c of channels) {
+  // API уже отсортировал каналы — подключённые (с заполненными
+  // credentials_enc) идут первыми, остальные ниже. Здесь просто
+  // отрисовываем две секции с заголовком, чтобы пользователь сразу видел
+  // где у него боевые каналы, а где ещё пусто.
+  const connected = channels.filter(c => c.is_connected);
+  const pending = channels.filter(c => !c.is_connected);
+  function channelCard(c) {
     const meta = CHANNEL_RU[c.kind] || { label: c.kind };
     const slug = c.slug || c.id;
-    wrap.append(el("a", { href: `#/projects/${projectSlug}/channels/${slug}`,
+    return el("a", { href: `#/projects/${projectSlug}/channels/${slug}`,
         style: "text-decoration:none;color:inherit" },
       el("div", { class: "card card-hover" },
         el("div", { class: "row between" },
@@ -521,7 +526,10 @@ function renderChannelsTab(projectSlug, channels) {
           el("div", { class: "row" }, langTag(c.language),
             c.is_video ? el("span", { class: "pill blue" }, "видео")
                        : el("span", { class: "pill gray" }, "текст"),
-            c.is_enabled ? pill("running") : pill("scheduled"))),
+            c.is_connected ? el("span", { class: "pill green" },
+              el("span", { class: "dot" }), "подключён")
+                           : el("span", { class: "pill gray" },
+              el("span", { class: "dot" }), "не подключён"))),
         el("div", { class: "spacer" }),
         el("div", { class: "kv" },
           el("div", {}, "Постов в день"), el("div", {}, c.posts_per_day),
@@ -529,9 +537,24 @@ function renderChannelsTab(projectSlug, channels) {
           el("div", {}, STRATEGY_RU[c.selection_strategy] || c.selection_strategy)),
         el("div", { class: "spacer" }),
         el("div", { style: "color:var(--accent);font-size:13px;font-weight:600" },
-          "Настроить и подключить →"))));
+          c.is_connected ? "Управлять каналом →"
+                         : "Подключить и настроить →")));
   }
-  return wrap;
+  function section(title, subtitle, list) {
+    if (!list.length) return null;
+    const grid = el("div", { class: "grid grid-2" });
+    list.forEach(c => grid.append(channelCard(c)));
+    return el("div", { class: "card-section" },
+      el("div", { style: "display:flex;align-items:baseline;gap:10px;margin-bottom:14px" },
+        el("h2", { style: "margin:0" }, title),
+        el("span", { class: "muted", style: "font-size:13px" }, subtitle)),
+      grid);
+  }
+  return el("div", {},
+    section("Подключённые каналы", "токены сохранены, готовы к публикации",
+      connected),
+    section("Не подключённые", "нужно ввести токены или ключи API",
+      pending));
 }
 
 // ---------- вкладка: посты --------------------------------------------------
@@ -827,6 +850,76 @@ router.add("/projects/:pkey/agents/:akey", async ({ pkey, akey }) => {
     }
   }
 
+  // --- Поиск в интернете (общий блок для любой роли) ---
+  // Поиск включён ⇔ params.search_query_template — непустая строка. Когда
+  // галочка стоит, показываем поля для шаблона запроса, глубины и числа
+  // результатов. Когда галочка снимается, шаблон обнуляется и executor
+  // пропускает Tavily-вызов на этом агенте. Этот блок намеренно живёт
+  // отдельно от param_schema, чтобы не дублировать его в каждой роли.
+  const searchOn = !!(currentParams.search_query_template
+                      && currentParams.search_query_template.trim());
+  const searchTplInp = el("input", { type: "text",
+    value: currentParams.search_query_template || "",
+    placeholder: "{{ topic.title }} {{ today_md }}",
+    "data-name": "search_query_template" });
+  const searchDepthSel = el("select", { "data-name": "search_depth" },
+    el("option", { value: "basic",
+      selected: (currentParams.search_depth || "basic") === "basic" },
+      "basic — 1 кредит Tavily"),
+    el("option", { value: "advanced",
+      selected: currentParams.search_depth === "advanced" },
+      "advanced — 2 кредита, глубже"));
+  const searchMaxInp = el("input", { type: "number",
+    value: currentParams.search_max_results || 5, min: "1", max: "20",
+    "data-name": "search_max_results" });
+  const searchFields = el("div", { class: "search-fields",
+    style: searchOn ? "" : "display:none" },
+    el("label", { class: "field" }, "Шаблон поискового запроса",
+      searchTplInp,
+      el("span", { class: "hint" },
+        "Mini-Jinja: можно вставлять {{ project.niche }}, {{ topic.title }}, " +
+        "{{ today_md }}, {{ language }}. Например для исследователя: " +
+        "{{ topic.title }} {{ topic.event_date }}.")),
+    el("label", { class: "field" }, "Глубина поиска",
+      searchDepthSel,
+      el("span", { class: "hint" },
+        "advanced даёт более длинные сниппеты, но стоит вдвое больше кредитов.")),
+    el("label", { class: "field" }, "Сколько результатов брать",
+      searchMaxInp,
+      el("span", { class: "hint" },
+        "Эти результаты подаются в LLM перед промтом как блок «WEB SEARCH RESULTS».")));
+  const searchToggle = el("input", { type: "checkbox",
+    style: "width:auto;margin-right:8px;vertical-align:middle" });
+  searchToggle.checked = searchOn;
+  const searchToggleLabel = el("span", { style: "font-size:14px" },
+    searchOn ? "включён" : "выключен");
+  searchToggle.addEventListener("change", () => {
+    searchToggleLabel.textContent = searchToggle.checked ? "включён" : "выключен";
+    searchFields.style.display = searchToggle.checked ? "" : "none";
+    // Если включаем впервые и шаблон пуст — подсказываем дефолт по роли.
+    if (searchToggle.checked && !searchTplInp.value.trim()) {
+      const presets = {
+        topic_generator: "{{ project.niche }} {{ today_md }} {{ language }}",
+        topic_validator: "{{ topic.title }} {{ topic.event_date }}",
+        researcher:      "{{ topic.title }} {{ topic.event_date }}",
+        research_validator: "{{ topic.title }}",
+      };
+      searchTplInp.value = presets[a.role] || "{{ topic.title }}";
+    }
+  });
+  const searchCard = el("div", { class: "card" },
+    el("h2", {}, "🔍 Поиск в интернете"),
+    el("div", { class: "muted",
+      style: "font-size:13px;margin-bottom:14px;line-height:1.5" },
+      "Если включено — перед вызовом LLM агент сделает один веб-поиск " +
+      "через Tavily и подсунет свежие результаты в промт. Полезно для " +
+      "ролей, которым нужны актуальные факты (генератор тем, " +
+      "исследователь). Для редактора/QA — не нужно."),
+    el("div", { style: "display:flex;align-items:center;margin-bottom:14px" },
+      searchToggle, searchToggleLabel),
+    searchFields);
+
+
   // --- Промт (большой текстарей) ---
   const promptCard = el("div", { class: "card" },
     el("h2", {}, "📝 Промт агента"),
@@ -866,6 +959,16 @@ router.add("/projects/:pkey/agents/:akey", async ({ pkey, akey }) => {
     if (roleParamsCard && schema.length > 0) {
       params = collectParamsFromForm(roleParamsCard, schema);
     }
+    // Search settings: чекбокс перетирает search_query_template поверх
+    // того, что собрано из роли. Снят флажок — пишем "" чтобы поиск
+    // выключился; стоит — берём шаблон/глубину/кол-во из формы.
+    if (searchToggle.checked) {
+      params.search_query_template = searchTplInp.value.trim();
+      params.search_depth = searchDepthSel.value;
+      params.search_max_results = parseInt(searchMaxInp.value, 10) || 5;
+    } else {
+      params.search_query_template = "";
+    }
     // JSON может перекрывать (если опытный пользователь там что-то добавил)
     const jsonRaw = advancedCard.querySelector('[data-name="params_json"]').value.trim();
     if (jsonRaw) {
@@ -897,6 +1000,7 @@ router.add("/projects/:pkey/agents/:akey", async ({ pkey, akey }) => {
 
   root.append(basicCard);
   if (roleParamsCard) root.append(roleParamsCard);
+  root.append(searchCard);
   root.append(promptCard);
   root.append(advancedCard);
   root.append(buttonsCard);
@@ -955,6 +1059,7 @@ router.add("/projects/:pkey/channels/:ckey", async ({ pkey, ckey }) => {
   const data = await api(`/api/projects/${pkey}/channels/${ckey}`);
   const c = data.channel; const spec = data.spec; const project = data.project;
   const meta = CHANNEL_RU[c.kind] || { label: c.kind };
+  const pipelineAgents = data.pipeline_agents || {};
 
   root.append(el("div", { class: "breadcrumbs" },
     el("a", { href: "#/projects" }, "Проекты"), " / ",
@@ -968,11 +1073,73 @@ router.add("/projects/:pkey/channels/:ckey", async ({ pkey, ckey }) => {
         el("div", { class: "muted", style: "margin-top:4px" }, meta.label))),
     el("div", { class: "row" }, langTag(c.language),
       c.is_video ? el("span", { class: "pill blue" }, "видео-канал")
-                 : el("span", { class: "pill gray" }, "текст"))));
+                 : el("span", { class: "pill gray" }, "текст"),
+      c.is_connected ? el("span", { class: "pill green" },
+        el("span", { class: "dot" }), "подключён")
+                     : el("span", { class: "pill gray" },
+        el("span", { class: "dot" }), "не подключён"))));
 
   // Гайд подключения
   root.append(el("div", { class: "guide-box markdown",
     html: "<h3>Как подключить канал</h3>" + renderMarkdown(spec.connect_guide_md) }));
+
+  // --- Команда этого канала: 4 группы агентов с быстрым переходом ---
+  // Сюда попадают все агенты, которые участвуют в производстве поста для
+  // данного канала: rewriter (свой), редакторская команда (по языку
+  // канала), команда сбора тем (общая), визуальная команда (общая).
+  const teamCard = el("div", { class: "card" },
+    el("h2", {}, "🤖 Команда этого канала"),
+    el("div", { class: "muted",
+      style: "font-size:13px;margin-bottom:14px;line-height:1.5" },
+      "Эти агенты работают вместе, чтобы получить пост для «" +
+      c.name + "». Кликни — попадёшь в карточку агента с его промтом и " +
+      "настройками."));
+  function teamGroup(title, subtitle, agents) {
+    if (!agents || !agents.length) return null;
+    const grid = el("div", { class: "grid grid-2",
+      style: "margin-top:10px;gap:8px" });
+    for (const ag of agents) {
+      const slug = ag.slug || ag.id;
+      // Per-channel rewriter has display_name "Адаптер — <channel>";
+      // for shared roles ROLE_RU is the canonical label.
+      const headline = (ag.role === "channel_rewriter" && ag.display_name)
+        ? ag.display_name
+        : (ROLE_RU[ag.role] || ag.display_name);
+      grid.append(el("a", {
+        href: `#/projects/${project.slug || project.id}/agents/${slug}`,
+        class: "agent-mini",
+        style: "text-decoration:none;color:inherit" },
+        el("div", { class: "agent-mini-row" },
+          el("div", { style: "font-weight:600;font-size:14px" }, headline),
+          el("div", { class: "row" }, langTag(ag.language))),
+        el("div", { class: "muted", style: "font-size:12px;margin-top:4px" },
+          el("code", { class: "inline" }, ag.model)),
+        el("div", { style: "color:var(--accent);font-size:12px;" +
+                          "margin-top:4px;font-weight:600" },
+          "открыть промт →")));
+    }
+    return el("div", { style: "margin-top:14px" },
+      el("div", { style: "font-weight:600;font-size:14px" }, title),
+      el("div", { class: "muted", style: "font-size:12px" }, subtitle),
+      grid);
+  }
+  const groups = [
+    teamGroup("Адаптер канала",
+      "переписывает универсальную статью в пост под этот канал",
+      pipelineAgents.rewriter),
+    teamGroup("Редакторская команда " +
+      (c.language === "ru" ? "(русская)" : "(английская)"),
+      "пишет универсальную статью на языке канала",
+      pipelineAgents.editorial_team),
+    teamGroup("Сбор тем (общий)",
+      "ищет события дня и ранжирует их — общий на весь проект",
+      pipelineAgents.topic_team),
+    teamGroup("Визуальная команда (общая)",
+      "пишет промт для иллюстрации и выбирает лучший вариант",
+      pipelineAgents.media_team),
+  ].filter(Boolean);
+  groups.forEach(g => teamCard.append(g));
+  root.append(teamCard);
 
   // Доступы
   const fields = spec.credentials_fields;
@@ -1045,12 +1212,18 @@ router.add("/projects/:pkey/channels/:ckey", async ({ pkey, ckey }) => {
   root.append(slotsCard);
 
   // Слоты публикации (редактируемые)
+  const tz = project.timezone || "UTC";
   const slotsEditCard = el("div", { class: "card" },
     el("h2", {}, "🕐 Слоты публикации"),
     el("div", { class: "muted",
       style: "font-size:13px;margin-bottom:14px;line-height:1.5" },
-      "В эти моменты канал будет автоматически публиковать посты " +
-      "(локальное время проекта)."));
+      "В эти моменты канал будет автоматически публиковать посты. " +
+      "Время указано по часовому поясу проекта: ",
+      el("code", { class: "inline" }, tz),
+      ". Изменить пояс можно во вкладке «Настройки» проекта.",
+      el("br"),
+      el("span", { style: "color:var(--accent)" },
+        "⚠️ Внимание: автоматический планировщик ещё не активен. ")));
 
   const slotsList = el("div", { class: "slots-list" });
   let slotsArr = (data.slots || []).map(s => ({
