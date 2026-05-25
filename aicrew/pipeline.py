@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -26,6 +27,10 @@ from .publishers import get_publisher
 from .scheduler import next_slot_utc, _utc_iso, publish_due_posts
 from .settings import Settings
 from .tools.image_gen import generate_image
+from .tools.tts_gen import generate_tts
+from .tools.video_assembler import assemble_video
+from .tools.video_gen import generate_video_clip
+from .tools.whisper_transcribe import transcribe_audio
 
 log = logging.getLogger("aicrew.pipeline")
 
@@ -690,6 +695,291 @@ class PipelineRunner:
             ).output
             body = rew_out.get("post_body", "")
         return body, article["chosen_headline"], article["chosen_image_id"]
+
+
+    # ---------------- video phase ---------------------------------------
+
+    # 9:16 is hard-coded by product decision; the UI does not expose it.
+    VIDEO_ASPECT = "9:16"
+
+    def run_video_phase(self, article_id: str) -> dict[str, Any]:
+        """Generate a short-form video for one article (mock-friendly).
+
+        Pipeline (10 steps):
+            [1] load article + topic + project + agents
+            [2] video_scenarist[lang]                -> scenes JSON
+            [3] video_keyframe_artist[bi]            -> keyframes JSON
+            [4] for each scene: image_gen            -> per-scene PNG
+            [5] for each scene: video_gen            -> per-scene MP4 (5s)
+            [6] voice_director[lang]                 -> normalised voiceover
+            [7] for each scene: tts_gen              -> per-scene MP3
+            [8] whisper_transcribe (on combined audio in mock: first MP3)
+            [9] subtitle_styler[lang]                -> ASS file
+            [10] video_assembler                     -> final MP4 (chosen=1)
+
+        Each step inserts ``media_assets`` rows with a ``meta`` JSON
+        describing its purpose. Only the final MP4 has ``chosen=1`` for
+        ``kind='video'`` — that's the article-level video record the API
+        looks up.
+        """
+        # ---- [1] load article + project + agents ----
+        with db.connect(self.settings.db_path) as conn:
+            article_row = conn.execute(
+                "SELECT * FROM articles WHERE id=?", (article_id,)
+            ).fetchone()
+            if article_row is None:
+                raise KeyError(article_id)
+            article = db.row_to_dict(article_row) or {}
+            project = _project(conn, article["project_id"])
+            topic_row = conn.execute(
+                "SELECT * FROM topics WHERE id=?", (article["topic_id"],)
+            ).fetchone()
+            topic = db.row_to_dict(topic_row) if topic_row else {}
+            agents = _agents_by_role(conn, article["project_id"])
+        lang = (article.get("language") or "ru").lower()
+        prid = self._start_pipeline_run(article["project_id"], "video")
+
+        article_inputs = {
+            "title_working": article.get("chosen_headline") or "",
+            "body_md": article.get("body_full", ""),
+            "tldr": (article.get("chosen_headline") or "")[:200],
+        }
+
+        # ---- [2] video_scenarist ----
+        scenarist = (agents.get(("video_scenarist", lang))
+                     or agents.get(("video_scenarist", "bi")))
+        if not scenarist:
+            raise RuntimeError(
+                f"video_scenarist agent missing for language={lang}; "
+                f"run soft-migration / re-seed the project."
+            )
+        # target_duration_s may have been stored as a string ("15"/"30"/"60")
+        # because the UI uses a string-valued select; cast back to int here.
+        sc_params = json.loads(scenarist["params"]) if isinstance(scenarist["params"], str) \
+            else dict(scenarist["params"] or {})
+        try:
+            target_dur_int = int(str(sc_params.get("target_duration_s", 30)).strip())
+        except (TypeError, ValueError):
+            target_dur_int = 30
+        sc_params["target_duration_s"] = target_dur_int
+        scenarist_runtime = dict(scenarist)
+        scenarist_runtime["params"] = json.dumps(sc_params)
+        scenes_out = self.executor.run(
+            agent=scenarist_runtime, pipeline_run_id=prid, article_id=article_id,
+            inputs={"article": article_inputs, "topic": topic, "language": lang},
+        ).output
+        scenes = scenes_out.get("scenes", []) or []
+        if not scenes:
+            raise RuntimeError("video_scenarist returned no scenes")
+
+        # ---- [3] video_keyframe_artist ----
+        kf_agent = (agents.get(("video_keyframe_artist", "bi"))
+                    or agents.get(("video_keyframe_artist", lang)))
+        if not kf_agent:
+            raise RuntimeError("video_keyframe_artist agent missing")
+        kf_out = self.executor.run(
+            agent=kf_agent, pipeline_run_id=prid, article_id=article_id,
+            inputs={"scenes": scenes, "article": article_inputs, "language": lang},
+        ).output
+        keyframes = {int(k.get("idx", i + 1)): k
+                     for i, k in enumerate(kf_out.get("keyframes", []) or [])}
+
+        # Resolve the image model from the project's image_prompt_writer
+        # (so the user's UI choice for project images is reused for keyframes).
+        ipw = (agents.get(("image_prompt_writer", "bi"))
+               or agents.get(("image_prompt_writer", lang)))
+        ipw_params = (json.loads(ipw["params"])
+                      if ipw and isinstance(ipw["params"], str)
+                      else (ipw or {}).get("params") or {})
+        image_model = ipw_params.get("image_model", "mock:placeholder") or "mock:placeholder"
+
+        kf_params = json.loads(kf_agent["params"]) if isinstance(kf_agent["params"], str) \
+            else dict(kf_agent["params"] or {})
+        video_model = kf_params.get("video_model", "302ai:wan2.2-i2v")
+
+        # ---- [4] image_gen per scene + [5] video_gen per scene ----
+        scene_clips: list[dict[str, Any]] = []
+        for i, scene in enumerate(scenes):
+            idx = int(scene.get("idx", i + 1))
+            duration = float(scene.get("duration_s") or 5.0)
+            kf = keyframes.get(idx) or {}
+            image_prompt = kf.get("image_prompt") or (
+                f"cinematic still: {scene.get('b_roll_idea') or 'scene'}, aspect 9:16"
+            )
+            i2v_prompt = kf.get("i2v_prompt") or "slow zoom in"
+            # [4] image
+            img = generate_image(image_prompt, settings=self.settings,
+                                  idx=idx, model=image_model)
+            img_id = db.new_id("ma_")
+            with db.connect(self.settings.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO media_assets (id, article_id, project_id, kind, "
+                    "language, prompt, model, storage_url, mime, width, height, "
+                    "chosen, meta, created_at) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        img_id, article_id, article["project_id"], "image",
+                        lang, image_prompt, img.model, img.storage_url, img.mime,
+                        img.width, img.height, 0,
+                        db.jdump({"scene_idx": idx, "purpose": "video_keyframe",
+                                   "topic_id": article.get("topic_id")}),
+                        db.now_iso(),
+                    ),
+                )
+            # [5] video clip
+            clip = generate_video_clip(
+                img.storage_url, i2v_prompt, settings=self.settings,
+                idx=idx, model=video_model, duration_s=duration,
+            )
+            clip_id = db.new_id("ma_")
+            with db.connect(self.settings.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO media_assets (id, article_id, project_id, kind, "
+                    "language, prompt, model, storage_url, mime, width, height, "
+                    "duration_s, chosen, meta, created_at) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        clip_id, article_id, article["project_id"], "video",
+                        lang, i2v_prompt, clip.model, clip.storage_url, clip.mime,
+                        clip.width, clip.height, clip.duration_s, 0,
+                        db.jdump({"scene_idx": idx, "purpose": "video_scene_clip"}),
+                        db.now_iso(),
+                    ),
+                )
+            scene_clips.append({
+                "idx": idx,
+                "clip_url": clip.storage_url,
+                "clip_path": os.path.join(self.settings.media_dir,
+                                            os.path.basename(clip.storage_url)),
+                "duration_s": duration,
+                "voiceover": scene.get("voiceover", ""),
+            })
+
+        # ---- [6] voice_director ----
+        vd_agent = (agents.get(("voice_director", lang))
+                    or agents.get(("voice_director", "bi")))
+        if not vd_agent:
+            raise RuntimeError(f"voice_director agent missing for language={lang}")
+        vd_out = self.executor.run(
+            agent=vd_agent, pipeline_run_id=prid, article_id=article_id,
+            inputs={"scenes": scenes, "language": lang},
+        ).output
+        normalized = {int(s.get("idx", i + 1)): s
+                      for i, s in enumerate(vd_out.get("scenes_normalized", []) or [])}
+        vd_params = json.loads(vd_agent["params"]) if isinstance(vd_agent["params"], str) \
+            else dict(vd_agent["params"] or {})
+        tts_model = vd_params.get("tts_model", "openai:gpt-4o-mini-tts")
+        voice_id = vd_params.get("voice_id", "onyx")
+        speed = float(vd_params.get("speed", 1.0) or 1.0)
+
+        # ---- [7] tts_gen per scene ----
+        for sc in scene_clips:
+            norm = normalized.get(sc["idx"]) or {}
+            text = (norm.get("voiceover_normalized")
+                    or sc.get("voiceover")
+                    or (f"Сцена {sc['idx']}." if lang == "ru" else f"Scene {sc['idx']}."))
+            tts = generate_tts(text, settings=self.settings, idx=sc["idx"],
+                                model=tts_model, voice_id=voice_id,
+                                speed=speed, language=lang)
+            tts_id = db.new_id("ma_")
+            with db.connect(self.settings.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO media_assets (id, article_id, project_id, kind, "
+                    "language, prompt, model, storage_url, mime, "
+                    "duration_s, chosen, meta, created_at) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        tts_id, article_id, article["project_id"], "audio",
+                        lang, text, tts.model, tts.storage_url, tts.mime,
+                        tts.duration_s, 0,
+                        db.jdump({"scene_idx": sc["idx"], "purpose": "voiceover",
+                                   "voice_id": tts.voice_id}),
+                        db.now_iso(),
+                    ),
+                )
+            sc["audio_url"] = tts.storage_url
+            sc["audio_path"] = os.path.join(self.settings.media_dir,
+                                              os.path.basename(tts.storage_url))
+
+        # ---- [8] combine audio (mock: first scene's MP3) + transcribe ----
+        combined_audio = scene_clips[0]["audio_url"] if scene_clips else ""
+        srt = transcribe_audio(combined_audio, settings=self.settings, language=lang)
+
+        # ---- [9] subtitle_styler -> ASS file ----
+        ss_agent = (agents.get(("subtitle_styler", lang))
+                    or agents.get(("subtitle_styler", "bi")))
+        if not ss_agent:
+            raise RuntimeError(f"subtitle_styler agent missing for language={lang}")
+        ss_out = self.executor.run(
+            agent=ss_agent, pipeline_run_id=prid, article_id=article_id,
+            inputs={"srt_text": srt.srt_text, "language": lang},
+        ).output
+        ass_text = ss_out.get("ass_text") or ""
+        ass_filename = f"{article_id}_{lang}.ass"
+        ass_path = os.path.join(self.settings.media_dir, ass_filename)
+        os.makedirs(self.settings.media_dir, exist_ok=True)
+        with open(ass_path, "w", encoding="utf-8") as fh:
+            fh.write(ass_text)
+        ass_id = db.new_id("ma_")
+        with db.connect(self.settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO media_assets (id, article_id, project_id, kind, "
+                "language, prompt, model, storage_url, mime, "
+                "chosen, meta, created_at) VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ass_id, article_id, article["project_id"], "subtitle",
+                    lang, "", "openai:whisper-1+subtitle_styler",
+                    f"/media/{ass_filename}", "text/x-ass",
+                    0,
+                    db.jdump({"format": "ass", "purpose": "final_subtitles",
+                               "srt_duration_s": srt.duration_s}),
+                    db.now_iso(),
+                ),
+            )
+
+        # ---- [10] video_assembler -> final MP4 ----
+        scenes_for_assembler = [
+            {
+                "clip_path": sc["clip_path"],
+                "audio_path": sc.get("audio_path", ""),
+                "ass_path": ass_path,
+                "duration_s": sc["duration_s"],
+            }
+            for sc in scene_clips
+        ]
+        final = assemble_video(
+            scenes_for_assembler, settings=self.settings,
+            article_id=article_id, language=lang,
+        )
+        final_id = db.new_id("ma_")
+        with db.connect(self.settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO media_assets (id, article_id, project_id, kind, "
+                "language, prompt, model, storage_url, mime, width, height, "
+                "duration_s, chosen, meta, created_at) VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    final_id, article_id, article["project_id"], "video",
+                    lang, "", video_model, final.storage_url, final.mime,
+                    final.width, final.height, final.duration_s, 1,
+                    db.jdump({"purpose": "final",
+                               "scenes_count": len(scene_clips),
+                               "aspect": self.VIDEO_ASPECT,
+                               "topic_id": article.get("topic_id")}),
+                    db.now_iso(),
+                ),
+            )
+            conn.execute(
+                "UPDATE pipeline_runs SET status='completed', finished_at=? WHERE id=?",
+                (db.now_iso(), prid),
+            )
+        return {
+            "final_video_url": final.storage_url,
+            "scenes_count": len(scene_clips),
+            "duration_s": final.duration_s,
+            "media_asset_id": final_id,
+        }
 
 
     # ---------------- helpers --------------------------------------------

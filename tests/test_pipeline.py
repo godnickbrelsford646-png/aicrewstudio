@@ -437,5 +437,81 @@ class SchedulerTimeTest(unittest.TestCase):
         self.assertEqual(out.hour, 12)
 
 
+class VideoPhaseTest(unittest.TestCase):
+    """End-to-end mock test for PipelineRunner.run_video_phase.
+
+    Seeds the demo project, picks one already-written article, runs the
+    video phase, and asserts the expected media_assets rows + the final
+    MP4 file on disk.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_video_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "video.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        # Make sure we don't accidentally hit any real API: a present
+        # AI302_API_KEY/OPENAI_API_KEY would route the helpers to the real
+        # path. The tools fall back to mock when the key is empty.
+        for k in ("AI302_API_KEY", "OPENAI_API_KEY"):
+            os.environ.pop(k, None)
+        self.settings = load_settings()
+
+    def test_run_video_phase_mock(self) -> None:
+        info = seed(self.settings)
+        # Need at least one article; the cheapest path is to run topic + article
+        # phases of the existing pipeline (mock-mode is fast and writes nothing
+        # to the network).
+        runner = PipelineRunner(self.settings)
+        runner.run_topic_phase(info["project_id"])
+        article_ids = runner.run_article_phase(info["project_id"], max_articles=1)
+        self.assertTrue(article_ids, "article phase produced no articles")
+        # Pick a Russian article (project default language).
+        with db.connect(self.settings.db_path) as conn:
+            row = conn.execute(
+                "SELECT id, language FROM articles WHERE id IN ({}) "
+                "ORDER BY language LIMIT 1".format(",".join(["?"] * len(article_ids))),
+                article_ids,
+            ).fetchone()
+        self.assertIsNotNone(row, "no article row to test against")
+        article_id = row["id"]
+        article_lang = row["language"]
+        # Run the video phase.
+        result = runner.run_video_phase(article_id)
+        # Basic shape checks.
+        self.assertTrue(result["final_video_url"].startswith("/media/"),
+                         f"unexpected url: {result['final_video_url']}")
+        self.assertGreaterEqual(result["scenes_count"], 5)
+        self.assertLessEqual(result["scenes_count"], 9)
+        self.assertGreater(result["duration_s"], 0)
+        # media_assets sanity.
+        with db.connect(self.settings.db_path) as conn:
+            chosen_video = conn.execute(
+                "SELECT * FROM media_assets WHERE article_id=? "
+                "AND kind='video' AND chosen=1",
+                (article_id,),
+            ).fetchall()
+            audios = conn.execute(
+                "SELECT * FROM media_assets WHERE article_id=? AND kind='audio'",
+                (article_id,),
+            ).fetchall()
+            subtitles = conn.execute(
+                "SELECT * FROM media_assets WHERE article_id=? AND kind='subtitle'",
+                (article_id,),
+            ).fetchall()
+        self.assertEqual(len(chosen_video), 1, "expected exactly one chosen=1 video row")
+        self.assertEqual(len(audios), result["scenes_count"],
+                          "expected one audio row per scene")
+        self.assertGreaterEqual(len(subtitles), 1, "expected at least one subtitle row")
+        # Final MP4 file present on disk with the canonical name.
+        final_path = os.path.join(
+            self.settings.media_dir, f"{article_id}_{article_lang}.mp4"
+        )
+        self.assertTrue(os.path.exists(final_path), f"missing {final_path}")
+        self.assertGreater(os.path.getsize(final_path), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

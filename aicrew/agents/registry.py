@@ -233,6 +233,65 @@ Article: {{ article.body_md }}
 Return JSON: { "hook": str, "scenes": [ {"idx": int, "voiceover": str, "on_screen_text": str, "b_roll_idea": str, "duration_s": number} ], "cta": str }
 """
 
+# Video keyframe artist: scenes -> per-scene image_prompt (still) and i2v_prompt
+# (motion). Bilingual prompt; English is fine since image/video models prefer it.
+VIDEO_KEYFRAME_ARTIST_TMPL = """\
+{% if language == 'ru' %}
+Для каждой сцены сценария напиши два промта:
+  - image_prompt: статичный кадр (на английском, как у image_prompt_writer);
+  - i2v_prompt: как этот кадр должен двигаться (slow zoom in, camera pans left, и т.п.).
+Стиль анимации: {{ params.style_preset }}.
+{% else %}
+For each scenario scene, write two prompts:
+  - image_prompt: a still frame description (English, like image_prompt_writer);
+  - i2v_prompt: how the frame should move (slow zoom in, camera pans left, etc.).
+Animation style: {{ params.style_preset }}.
+{% endif %}
+Scenes: {{ scenes }}
+Article TLDR: {{ article.tldr }}
+Return JSON: { "keyframes": [ {"idx": int, "image_prompt": str, "i2v_prompt": str} ] }
+"""
+
+# Voice director: takes raw voiceover lines and normalises them for TTS —
+# tempo, SSML pauses, length cap per scene.duration_s.
+VOICE_DIRECTOR_TMPL = """\
+{% if language == 'ru' %}
+Подгони закадровый текст под длительность каждой сцены.
+Расставь SSML-паузы (<break time="300ms"/>) на естественных границах.
+Сократи текст, если не влезает в scene.duration_s (≈15 знаков/секунду).
+Голос: {{ params.voice_id }}, скорость {{ params.speed }}.
+{% else %}
+Adjust the voiceover to fit each scene's duration.
+Insert SSML breaks (<break time="300ms"/>) at natural boundaries.
+Trim text if it does not fit scene.duration_s (≈15 chars/sec).
+Voice: {{ params.voice_id }}, speed {{ params.speed }}.
+{% endif %}
+Scenes: {{ scenes }}
+Return JSON: { "scenes_normalized": [ {"idx": int, "voiceover_normalized": str, "estimated_duration_s": number} ] }
+"""
+
+# Subtitle styler: SRT (from Whisper) -> ASS with project styling.
+SUBTITLE_STYLER_TMPL = """\
+{% if language == 'ru' %}
+Преобразуй SRT-субтитры в ASS со стилями:
+шрифт {{ params.font }}, размер {{ params.font_size }}, цвет {{ params.color }},
+положение {{ params.position }}.
+{% if params.highlight_keywords %}Ключевые слова — выделять цветом.{% endif %}
+{% else %}
+Convert SRT subtitles to ASS with styling:
+font {{ params.font }}, size {{ params.font_size }}, color {{ params.color }},
+position {{ params.position }}.
+{% if params.highlight_keywords %}Highlight keywords with colour.{% endif %}
+{% endif %}
+SRT input:
+{{ srt_text }}
+Return JSON: { "ass_text": str }
+"""
+
+# Video assembler: non-LLM orchestrator. Prompt template is a stub that
+# documents the role; the actual stitching happens in tools/video_assembler.py.
+VIDEO_ASSEMBLER_TMPL = "Video assembler is a non-LLM orchestrator. No prompt is sent."
+
 # ---- Mock generators (registered in llm.adapter via decorator) ------------
 
 from ..llm.adapter import register
@@ -550,6 +609,129 @@ def _gen_video_scenarist(inputs: dict[str, Any], params: dict[str, Any], languag
     }
 
 
+@register("video_keyframe_artist")
+def _gen_video_keyframe_artist(inputs: dict[str, Any], params: dict[str, Any], language: str) -> dict[str, Any]:
+    style = params.get("style_preset", "cinematic_historical")
+    scenes = inputs.get("scenes", []) or []
+    base_title = inputs.get("article", {}).get("title_working", "Story")
+    keyframes: list[dict[str, Any]] = []
+    motions = [
+        "slow zoom in", "slow zoom out", "camera pans left",
+        "camera pans right", "subtle parallax", "tilt up slowly",
+    ]
+    for i, sc in enumerate(scenes):
+        idx = int(sc.get("idx", i + 1))
+        b_roll = sc.get("b_roll_idea") or "scene"
+        keyframes.append({
+            "idx": idx,
+            "image_prompt": (
+                f"cinematic still frame for '{base_title}', scene {idx}: "
+                f"{b_roll}, style={style}, aspect 9:16, photoreal, "
+                f"shallow depth of field"
+            ),
+            "i2v_prompt": motions[i % len(motions)],
+        })
+    return {"keyframes": keyframes}
+
+
+@register("voice_director")
+def _gen_voice_director(inputs: dict[str, Any], params: dict[str, Any], language: str) -> dict[str, Any]:
+    scenes = inputs.get("scenes", []) or []
+    out: list[dict[str, Any]] = []
+    # Approximate speech rate: 15 chars/sec narration speed.
+    chars_per_sec = 15.0
+    for i, sc in enumerate(scenes):
+        idx = int(sc.get("idx", i + 1))
+        duration = float(sc.get("duration_s") or 5.0)
+        text = (sc.get("voiceover") or "").strip()
+        max_chars = int(duration * chars_per_sec)
+        if max_chars > 0 and len(text) > max_chars:
+            text = text[: max_chars - 1].rstrip() + "…"
+        # Insert one SSML break at the midpoint if the text has a natural
+        # boundary (sentence end).
+        if "." in text and len(text) > 30:
+            head, _, tail = text.partition(".")
+            text = head + '. <break time="300ms"/>' + tail
+        out.append({
+            "idx": idx,
+            "voiceover_normalized": text or (
+                f"Сцена {idx}." if language == "ru" else f"Scene {idx}."
+            ),
+            "estimated_duration_s": round(min(duration, max(2.0, len(text) / chars_per_sec)), 2),
+        })
+    return {"scenes_normalized": out}
+
+
+@register("subtitle_styler")
+def _gen_subtitle_styler(inputs: dict[str, Any], params: dict[str, Any], language: str) -> dict[str, Any]:
+    """Mock SRT -> ASS conversion. Returns a minimal but valid ASS body."""
+    srt_text = inputs.get("srt_text") or ""
+    font = params.get("font", "Inter")
+    font_size = int(params.get("font_size", 54) or 54)
+    color = (params.get("color") or "#FFFFFF").lstrip("#")
+    # ASS colour is &H<AA><BB><GG><RR> (alpha first, then BGR).
+    if len(color) == 6:
+        rr, gg, bb = color[0:2], color[2:4], color[4:6]
+        ass_color = f"&H00{bb}{gg}{rr}"
+    else:
+        ass_color = "&H00FFFFFF"
+    # Map our position selector to ASS Alignment numbers.
+    align_map = {"top_center": 8, "middle": 5, "bottom_center": 2}
+    alignment = align_map.get(params.get("position", "bottom_center"), 2)
+    # Convert SRT blocks to ASS Dialogue lines (best-effort; mock-grade).
+    dialogues: list[str] = []
+    blocks = [b.strip() for b in srt_text.strip().split("\n\n") if b.strip()]
+    for block in blocks:
+        lines = block.splitlines()
+        if len(lines) < 3:
+            continue
+        ts_line = lines[1]
+        text = " ".join(lines[2:]).replace("\n", " ")
+        try:
+            start_str, end_str = [s.strip() for s in ts_line.split("-->")]
+            def _to_ass_ts(s: str) -> str:
+                # SRT: HH:MM:SS,mmm -> ASS: H:MM:SS.cc (centiseconds)
+                hh, mm, sec = s.split(":")
+                ss, ms = sec.replace(",", ".").split(".") if "." in sec else (sec, "0")
+                cs = int(round(int(ms.ljust(3, "0")[:3]) / 10))
+                return f"{int(hh)}:{mm}:{ss}.{cs:02d}"
+            dialogues.append(
+                f"Dialogue: 0,{_to_ass_ts(start_str)},{_to_ass_ts(end_str)},"
+                f"Default,,0,0,0,,{text}"
+            )
+        except Exception:
+            continue
+    if not dialogues:
+        dialogues.append("Dialogue: 0,0:00:00.00,0:00:03.00,Default,,0,0,0,,[mock subtitle]")
+    ass_text = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "PlayResX: 1080\n"
+        "PlayResY: 1920\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, "
+        "Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+        "MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,{font},{font_size},{ass_color},&H00000000,&H64000000,"
+        f"-1,0,0,0,100,100,0,0,1,2,1,{alignment},20,20,40,1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+        "MarginV, Effect, Text\n"
+        + "\n".join(dialogues) + "\n"
+    )
+    return {"ass_text": ass_text}
+
+
+@register("video_assembler")
+def _gen_video_assembler(inputs: dict[str, Any], params: dict[str, Any], language: str) -> dict[str, Any]:
+    """Non-LLM orchestrator. The actual stitching happens in
+    aicrew/tools/video_assembler.py; this mock just confirms the role exists
+    so a manual run from the agents UI doesn't crash."""
+    scenes = inputs.get("scenes", []) or []
+    return {"status": "assembled", "scenes_processed": len(scenes)}
+
+
 # ---- Role catalog ---------------------------------------------------------
 
 ROLES: dict[str, AgentRoleSpec] = {
@@ -718,8 +900,53 @@ ROLES: dict[str, AgentRoleSpec] = {
         default_temperature=0.7,
         default_max_tokens=2000,
         prompt_template=VIDEO_SCENARIST_TMPL,
-        default_params={"target_duration_s": 30, "aspect": "9:16",
-                        "style_preset": "talking_head_b-roll"},
+        default_params={"target_duration_s": 30,
+                        "style_preset": "cinematic_narrator"},
+    ),
+    "video_keyframe_artist": AgentRoleSpec(
+        role="video_keyframe_artist",
+        display_name="Video Keyframe Artist",
+        description="Produces per-scene image_prompt + i2v_prompt pairs.",
+        default_model="mock:cheap",
+        default_temperature=0.6,
+        default_max_tokens=1500,
+        prompt_template=VIDEO_KEYFRAME_ARTIST_TMPL,
+        default_params={"video_model": "302ai:wan2.2-i2v",
+                        "style_preset": "cinematic_historical"},
+    ),
+    "voice_director": AgentRoleSpec(
+        role="voice_director",
+        display_name="Voice Director",
+        description="Normalises voiceover text for TTS: tempo, SSML breaks, length.",
+        default_model="mock:smart",
+        default_temperature=0.4,
+        default_max_tokens=1500,
+        prompt_template=VOICE_DIRECTOR_TMPL,
+        default_params={"tts_model": "openai:gpt-4o-mini-tts",
+                        "voice_id": "onyx",
+                        "speed": 1.0},
+    ),
+    "subtitle_styler": AgentRoleSpec(
+        role="subtitle_styler",
+        display_name="Subtitle Styler",
+        description="Converts SRT (Whisper) into styled ASS subtitles.",
+        default_model="mock:cheap",
+        default_temperature=0.2,
+        default_max_tokens=2000,
+        prompt_template=SUBTITLE_STYLER_TMPL,
+        default_params={"font": "Inter", "font_size": 54,
+                        "color": "#FFFFFF", "position": "bottom_center",
+                        "highlight_keywords": True},
+    ),
+    "video_assembler": AgentRoleSpec(
+        role="video_assembler",
+        display_name="Video Assembler",
+        description="Non-LLM orchestrator that stitches clips, audio and subtitles.",
+        default_model="mock:cheap",
+        default_temperature=0.0,
+        default_max_tokens=200,
+        prompt_template=VIDEO_ASSEMBLER_TMPL,
+        default_params={},
     ),
 }
 
@@ -742,11 +969,13 @@ def role_spec(role: str) -> AgentRoleSpec:
 # image, attached to all of them.
 LANG_SCOPED_ROLES = {"researcher", "research_validator", "article_writer",
                      "headline_writer",
-                     "qa_editorial", "video_scenarist"}
+                     "qa_editorial", "video_scenarist",
+                     "voice_director", "subtitle_styler"}
 
 # Roles that exist project-wide (one instance regardless of language).
 GLOBAL_ROLES = {"topic_generator", "topic_validator", "topic_ranker",
-                "image_prompt_writer", "qa_visual"}
+                "image_prompt_writer", "qa_visual",
+                "video_keyframe_artist", "video_assembler"}
 
 
 def default_agents_for_project(language_modes: list[str]) -> list[dict[str, Any]]:

@@ -17,7 +17,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
 from . import db
-from .agents.registry import role_spec
+from .agents.registry import (
+    default_agents_for_project,
+    role_spec,
+)
 from .agents.param_schema import schema_payload
 from .channels.registry import CHANNEL_KINDS, list_kinds
 from .crypto import decrypt, encrypt, mask
@@ -666,11 +669,65 @@ def _get_article(h: "AicrewHandler", p: dict[str, str]) -> None:
             except Exception:
                 connected = False
         ch["is_connected"] = connected
+    # Final video lookup: by product decision, the only kind='video' row
+    # with chosen=1 is the assembled, final clip. Per-scene clips have
+    # chosen=0 (see PipelineRunner.run_video_phase). If nothing matches,
+    # the article hasn't been turned into a video yet and we return null.
+    video_payload: dict[str, Any] | None = None
+    with db.connect(h.settings.db_path) as conn:
+        vrow = conn.execute(
+            "SELECT * FROM media_assets WHERE article_id=? AND kind='video' "
+            "AND chosen=1 ORDER BY created_at DESC LIMIT 1",
+            (p["aid"],),
+        ).fetchone()
+    if vrow is not None:
+        v = db.row_to_dict(vrow) or {}
+        meta = db.jload(v.get("meta"), {}) or {}
+        video_payload = {
+            "url": v.get("storage_url"),
+            "duration_s": v.get("duration_s") or 0,
+            "scenes_count": int(meta.get("scenes_count") or 0),
+            "created_at": v.get("created_at"),
+        }
     h.send_json(200, {
         "project": {"id": project["id"], "slug": project["slug"], "name": project["name"]},
         "article": article, "media": media, "agent_runs": runs,
         "topic": db.row_to_dict(topic),
         "channels": project_channels, "posts": art_posts,
+        "video": video_payload,
+    })
+
+
+@route("POST", "/api/projects/{pkey}/articles/{aid}/generate_video")
+def _generate_video(h: "AicrewHandler", p: dict[str, str]) -> None:
+    """Synchronously run the video phase for one article and return the
+    final MP4 URL. In mock mode this writes ~12 placeholder media files
+    in <media_dir>; in real mode it would talk to 302.ai / OpenAI / ffmpeg.
+    """
+    project = _resolve_project(h, p["pkey"])
+    if project is None:
+        return
+    aid = p["aid"]
+    with db.connect(h.settings.db_path) as conn:
+        row = conn.execute(
+            "SELECT id, project_id FROM articles WHERE id=? AND project_id=?",
+            (aid, project["id"]),
+        ).fetchone()
+    if row is None:
+        h.send_json(404, {"error": "article not found"})
+        return
+    runner = PipelineRunner(h.settings)
+    try:
+        result = runner.run_video_phase(aid)
+    except Exception as exc:
+        log.exception("run_video_phase failed for article=%s", aid)
+        h.send_json(500, {"error": repr(exc)})
+        return
+    h.send_json(200, {
+        "final_video_url": result["final_video_url"],
+        "duration_s": result["duration_s"],
+        "scenes_count": result["scenes_count"],
+        "media_asset_id": result["media_asset_id"],
     })
 
 
@@ -897,6 +954,71 @@ class AicrewHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _ensure_default_agents_for_existing_projects(settings: Settings) -> None:
+    """Add missing default agents to existing projects after a code upgrade.
+
+    Walks every project in the DB and compares its current
+    ``(role, language)`` agent set against the expected set from
+    ``default_agents_for_project(language_modes)``. Inserts only the missing
+    ones with their registry defaults; never modifies or deletes existing
+    rows. This is what lets a user run ``git pull && systemctl restart``
+    and pick up new roles (e.g. the video team) automatically.
+
+    Called from ``serve()``. Idempotent — re-running adds nothing once the
+    project is up to date.
+    """
+    with db.connect(settings.db_path) as conn:
+        projects = db.rows_to_list(conn.execute(
+            "SELECT id, name, language_modes FROM projects"
+        ).fetchall())
+    for proj in projects:
+        try:
+            languages = json.loads(proj.get("language_modes") or '["ru"]')
+            if not isinstance(languages, list) or not languages:
+                languages = ["ru"]
+        except json.JSONDecodeError:
+            languages = ["ru"]
+        with db.connect(settings.db_path) as conn:
+            existing_rows = conn.execute(
+                "SELECT role, language FROM agents WHERE project_id=?",
+                (proj["id"],),
+            ).fetchall()
+            existing = {(r["role"], r["language"] or "bi") for r in existing_rows}
+            added = 0
+            for entry in default_agents_for_project(languages):
+                key = (entry["role"], entry["language"])
+                if key in existing:
+                    continue
+                spec = entry["spec"]
+                base_slug = entry["role"].replace("_", "-")
+                if entry["language"] in ("ru", "en"):
+                    base_slug += "-" + entry["language"]
+                slug = db.unique_slug(
+                    conn, "agents", base_slug,
+                    scope_col="project_id", scope_val=proj["id"],
+                )
+                conn.execute(
+                    "INSERT INTO agents (id, project_id, slug, role, "
+                    "display_name, description, model, temperature, max_tokens, "
+                    "top_p, prompt_template, params, tools_enabled, language, "
+                    "is_enabled, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        db.new_id("ag_"), proj["id"], slug, entry["role"],
+                        entry["display_name"], spec.description,
+                        spec.default_model, spec.default_temperature,
+                        spec.default_max_tokens, 1.0, spec.prompt_template,
+                        json.dumps(spec.default_params),
+                        json.dumps(list(spec.tools)),
+                        entry["language"], 1, db.now_iso(), db.now_iso(),
+                    ),
+                )
+                added += 1
+        if added:
+            log.info("ensuring video team for project %s: added %d new agents",
+                     proj["id"], added)
+
+
 def serve(settings: Settings | None = None) -> None:
     settings = settings or load_settings()
     AicrewHandler.settings = settings
@@ -906,6 +1028,12 @@ def serve(settings: Settings | None = None) -> None:
     # an old DB created before the scheduler existed would crash the very
     # first tick. Cheap to call when the schema is already current.
     db.init_schema(settings.db_path)
+    # Soft-migrate agents: existing projects need to pick up new roles
+    # introduced by `git pull` (e.g. the video team — video_keyframe_artist,
+    # voice_director, subtitle_styler, video_assembler) without forcing
+    # the user to re-seed and lose their data. We only INSERT missing rows;
+    # existing agents are never touched.
+    _ensure_default_agents_for_existing_projects(settings)
     server = ThreadingHTTPServer(("0.0.0.0", settings.port), AicrewHandler)
     log.warning("serving on http://0.0.0.0:%d (db=%s, llm=%s)",
                 settings.port, settings.db_path, settings.llm_provider)

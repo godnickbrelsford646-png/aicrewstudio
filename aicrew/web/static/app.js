@@ -1448,6 +1448,40 @@ router.add("/projects/:pkey/articles/:aid", async ({ pkey, aid }) => {
         "Зелёная рамка — выбрано QA для публикации."), gallery));
   }
 
+  // ─── 🎬 Видео ─────────────────────────────────────────────────────────
+  // Финальный MP4 хранится как media_assets.kind='video' AND chosen=1.
+  // API отдаёт его в ответе под ключом `video` либо null. Если ещё не
+  // сгенерировано — кнопка запускает run_video_phase() синхронно.
+  const video = data.video;
+  if (video && video.url) {
+    root.append(el("div", { class: "card" },
+      el("h2", {}, "🎬 Видео"),
+      el("video", { src: video.url, controls: true,
+                    style: "width:100%;max-width:540px;border-radius:8px" }),
+      el("div", { class: "muted sm" },
+        `Длительность: ${video.duration_s}с · ${video.scenes_count} сцен`)
+    ));
+  } else {
+    root.append(el("div", { class: "card" },
+      el("h2", {}, "🎬 Видео"),
+      el("p", { class: "muted" }, "Видео ещё не сгенерировано."),
+      el("button", { class: "primary",
+        on: { click: async (ev) => {
+          const btn = ev.currentTarget;
+          btn.disabled = true; btn.textContent = "Генерация…";
+          try {
+            await api(`/api/projects/${pkey}/articles/${aid}/generate_video`,
+                      { method: "POST" });
+            location.reload();
+          } catch (e) {
+            alert("Ошибка: " + e.message);
+            btn.disabled = false; btn.textContent = "Сгенерировать видео";
+          }
+        }}
+      }, "Сгенерировать видео")
+    ));
+  }
+
   root.append(el("div", { class: "card markdown" },
     el("h2", {}, "📄 Текст статьи (универсальная версия)"),
     el("div", { class: "muted", style: "font-size:12px;margin-bottom:12px" },
