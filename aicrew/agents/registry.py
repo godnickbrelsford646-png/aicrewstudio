@@ -199,6 +199,25 @@ Headlines: {{ headlines }}
 Return JSON: { "chosen_headline": str, "revised_body_md": str, "issues":[{"severity":str,"note":str}], "score": int }
 """
 
+# Fact audit: post-writer factcheck against the validated research brief.
+# Generic registry-level template. Real prompt for "Задним числом" lives in
+# seed.py (ZADNIM_PROMPTS["fact_audit"]). This stub only documents the shape
+# so a project without a custom prompt still produces a valid JSON result.
+FACT_AUDIT_TMPL = """\
+{% if language == 'ru' %}
+Ты — фактчекер. Проверь, что каждое имя/цифра/цитата из article.body_md
+встречается в research_validated. Удали или перефразируй то, чего там нет.
+{% else %}
+You are a fact-checker. Verify that every name/number/quote in
+article.body_md is present in research_validated. Drop or rephrase
+anything that isn't.
+{% endif %}
+Article: {{ article.body_md }}
+Research validated: {{ research_validated }}
+Return JSON: { "unsupported_claims":[{"claim":str,"fragment":str,"severity":str}],
+"fixed_body_md": str, "score": int, "must_fix": bool }
+"""
+
 QA_VISUAL_TMPL = """\
 {% if language == 'ru' %}Выбери лучшую картинку из вариантов для статьи "{{ article.title_working }}".
 {% else %}Pick the best image variant for article "{{ article.title_working }}".
@@ -549,6 +568,25 @@ def _gen_qa_editorial(inputs: dict[str, Any], params: dict[str, Any], language: 
     }
 
 
+@register("fact_audit")
+def _gen_fact_audit(inputs: dict[str, Any], params: dict[str, Any], language: str) -> dict[str, Any]:
+    """Mock fact_audit: returns the body unchanged with a clean score.
+
+    Real (LLM-driven) implementation walks the article body, extracts
+    claims (names, numbers, direct quotes, dates) and verifies each one
+    against ``research_validated`` (facts/stats/quotes/hero/...).
+    The mock here returns no findings so the rest of the pipeline keeps
+    working in unit tests."""
+    article = inputs.get("article", {}) or {}
+    body = article.get("body_md", "")
+    return {
+        "unsupported_claims": [],
+        "score": 95,
+        "must_fix": False,
+        "fixed_body_md": body,
+    }
+
+
 @register("qa_visual")
 def _gen_qa_visual(inputs: dict[str, Any], params: dict[str, Any], language: str) -> dict[str, Any]:
     options = inputs.get("image_options", []) or []
@@ -872,6 +910,22 @@ ROLES: dict[str, AgentRoleSpec] = {
         prompt_template=QA_EDITORIAL_TMPL,
         default_params={"min_score": 80},
     ),
+    "fact_audit": AgentRoleSpec(
+        role="fact_audit",
+        display_name="Fact Audit",
+        description=("Post-writer factchecker: verifies every name, number "
+                     "and quote in the article body against the validated "
+                     "research brief; rewrites unsupported fragments."),
+        default_model="mock:smart",
+        default_temperature=0.2,
+        default_max_tokens=2500,
+        prompt_template=FACT_AUDIT_TMPL,
+        # min_score=80 is stricter than QA's 75 — the fact-check bar must
+        # be higher because a single fabricated fact poisons trust in the
+        # whole article, while QA editorial only judges literary quality.
+        default_params={"min_score": 80},
+        tools=(),
+    ),
     "qa_visual": AgentRoleSpec(
         role="qa_visual",
         display_name="QA Visual",
@@ -969,7 +1023,7 @@ def role_spec(role: str) -> AgentRoleSpec:
 # image, attached to all of them.
 LANG_SCOPED_ROLES = {"researcher", "research_validator", "article_writer",
                      "headline_writer",
-                     "qa_editorial", "video_scenarist",
+                     "qa_editorial", "fact_audit", "video_scenarist",
                      "voice_director", "subtitle_styler"}
 
 # Roles that exist project-wide (one instance regardless of language).
@@ -1026,6 +1080,7 @@ TEAM_KIND_FOR_ROLE: dict[str, str | None] = {
     "article_writer":      "text",
     "headline_writer":     "text",
     "qa_editorial":        "text",
+    "fact_audit":          "text",
     # video production team
     "video_scenarist":     "video",
     "voice_director":      "video",

@@ -1367,5 +1367,206 @@ class ProjectCostsEndpointTest(unittest.TestCase):
         self.assertIn("topic_generator", roles_seen)
 
 
+class AntiHallucinationTest(unittest.TestCase):
+    """Tests for the anti-hallucination hardening pass.
+
+    Covers:
+      - registration of the new fact_audit role,
+      - idempotent migration that syncs ZADNIM prompts and
+        creates missing fact_audit agents,
+      - lowered article_writer temperature,
+      - research_validator now has a non-empty Tavily query template,
+      - fact_audit actually fires for every text language during a
+        full mock pipeline run.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_anti_halluc_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "anti.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        self.settings = load_settings()
+
+    # --- 1) role registration ------------------------------------------------
+
+    def test_fact_audit_role_registered(self) -> None:
+        from aicrew.agents.registry import (
+            ROLES,
+            LANG_SCOPED_ROLES,
+            TEAM_KIND_FOR_ROLE,
+            role_spec,
+        )
+        self.assertIn("fact_audit", ROLES)
+        self.assertIn("fact_audit", LANG_SCOPED_ROLES)
+        self.assertEqual(TEAM_KIND_FOR_ROLE.get("fact_audit"), "text")
+        spec = role_spec("fact_audit")
+        self.assertEqual(spec.role, "fact_audit")
+        # Has a non-trivial prompt template (the registry stub at minimum).
+        self.assertGreater(len(spec.prompt_template), 50)
+        # Default min_score = 80 (stricter than qa_editorial's 75).
+        self.assertEqual(spec.default_params.get("min_score"), 80)
+
+    def test_fact_audit_param_schema_exposed(self) -> None:
+        from aicrew.agents.param_schema import PARAM_SCHEMAS, schema_for
+        self.assertIn("fact_audit", PARAM_SCHEMAS)
+        fields = schema_for("fact_audit")
+        self.assertEqual([f.key for f in fields], ["min_score"])
+        # The audit bar is stricter: default 80 (qa_editorial defaults to 75).
+        self.assertEqual(fields[0].default, 80)
+
+    # --- 2) integration: fact_audit runs in the pipeline --------------------
+
+    def test_fact_audit_in_pipeline(self) -> None:
+        info = seed(self.settings)
+        runner = PipelineRunner(self.settings)
+        runner.run_full(info["project_id"])
+        with db.connect(self.settings.db_path) as conn:
+            rows = conn.execute(
+                "SELECT a.role, a.language FROM agent_runs ar "
+                "JOIN agents a ON a.id = ar.agent_id "
+                "WHERE a.project_id=? AND a.role='fact_audit'",
+                (info["project_id"],),
+            ).fetchall()
+        seen_langs = {r["language"] for r in rows}
+        self.assertGreater(len(rows), 0,
+                           "fact_audit must produce at least one agent_run")
+        # Demo project has both ru and en text teams.
+        self.assertIn("ru", seen_langs)
+        self.assertIn("en", seen_langs)
+
+    # --- 3) migration: creates missing fact_audit ---------------------------
+
+    def test_zadnim_migration_creates_fact_audit(self) -> None:
+        # Seed once to get a project with the full agent set.
+        info = seed(self.settings)
+        project_id = info["project_id"]
+        # Simulate an "old" DB by deleting the fact_audit agents that
+        # seed() just created; init_schema must put them back.
+        with db.connect(self.settings.db_path) as conn:
+            cur = conn.execute(
+                "DELETE FROM agents WHERE project_id=? AND role='fact_audit'",
+                (project_id,),
+            )
+            self.assertGreater(cur.rowcount, 0,
+                               "preconditions: seed should produce fact_audit agents")
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS c FROM agents WHERE project_id=? AND role='fact_audit'",
+                (project_id,),
+            ).fetchone()["c"]
+            self.assertEqual(remaining, 0)
+        # Re-run init_schema (the migration that should re-seed fact_audit).
+        db.init_schema(self.settings.db_path)
+        with db.connect(self.settings.db_path) as conn:
+            rows = conn.execute(
+                "SELECT language FROM agents WHERE project_id=? AND role='fact_audit' "
+                "ORDER BY language",
+                (project_id,),
+            ).fetchall()
+        langs = sorted(r["language"] for r in rows)
+        self.assertEqual(langs, ["en", "ru"],
+                         "migration must seed one fact_audit agent per language")
+
+    # --- 4) migration: refreshes prompts ------------------------------------
+
+    def test_zadnim_migration_updates_prompts(self) -> None:
+        info = seed(self.settings)
+        project_id = info["project_id"]
+        # Pick the article_writer (ru) and stomp its prompt to simulate
+        # an older deployment running with stale text.
+        with db.connect(self.settings.db_path) as conn:
+            agent = conn.execute(
+                "SELECT id, prompt_template FROM agents "
+                "WHERE project_id=? AND role='article_writer' AND language='ru'",
+                (project_id,),
+            ).fetchone()
+            self.assertIsNotNone(agent, "article_writer (ru) should exist")
+            original_len = len(agent["prompt_template"])
+            self.assertGreater(original_len, 100)
+            conn.execute(
+                "UPDATE agents SET prompt_template='' WHERE id=?",
+                (agent["id"],),
+            )
+            zeroed = conn.execute(
+                "SELECT prompt_template FROM agents WHERE id=?",
+                (agent["id"],),
+            ).fetchone()
+            self.assertEqual(zeroed["prompt_template"], "")
+        # Re-run init_schema; the sync step should restore the prompt.
+        db.init_schema(self.settings.db_path)
+        with db.connect(self.settings.db_path) as conn:
+            restored = conn.execute(
+                "SELECT prompt_template FROM agents "
+                "WHERE project_id=? AND role='article_writer' AND language='ru'",
+                (project_id,),
+            ).fetchone()
+        self.assertGreater(len(restored["prompt_template"]), 100,
+                           "init_schema must restore article_writer prompt")
+        # The restored prompt must include one of the new ground-rule
+        # markers, proving it's the new version, not just non-empty.
+        self.assertIn("GROUND RULES", restored["prompt_template"])
+
+    # --- 5) migration: idempotent ------------------------------------------
+
+    def test_zadnim_migration_idempotent(self) -> None:
+        info = seed(self.settings)
+        project_id = info["project_id"]
+
+        def count_agents() -> int:
+            with db.connect(self.settings.db_path) as conn:
+                return conn.execute(
+                    "SELECT COUNT(*) AS c FROM agents WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()["c"]
+
+        first = count_agents()
+        db.init_schema(self.settings.db_path)
+        second = count_agents()
+        db.init_schema(self.settings.db_path)
+        third = count_agents()
+        self.assertEqual(first, second,
+                         "first re-run of init_schema must not change agent count")
+        self.assertEqual(second, third,
+                         "second re-run of init_schema must not change agent count")
+
+    # --- 6) topic_validator: per-candidate query template -------------------
+
+    def test_topic_validator_per_candidate_search(self) -> None:
+        from aicrew.seed import ZADNIM_AGENT_PARAMS
+        tpl = ZADNIM_AGENT_PARAMS["topic_validator"]["search_query_template"]
+        # The template MUST address a specific candidate, not the whole
+        # day. Anything else and the validator goes back to checking
+        # "{{ today_md }} historical events" in bulk (the bug we are
+        # fixing).
+        self.assertIn("candidate_topics[0].title", tpl)
+        self.assertIn("candidate_topics[0].event_date", tpl)
+        # And the generic per-day template must be gone.
+        self.assertNotIn("historical events fact check", tpl)
+
+    # --- 7) research_validator: search re-enabled ---------------------------
+
+    def test_research_validator_search_enabled(self) -> None:
+        from aicrew.seed import ZADNIM_AGENT_PARAMS
+        params = ZADNIM_AGENT_PARAMS["research_validator"]
+        self.assertNotEqual(params.get("search_query_template", ""), "",
+                            "research_validator must run a second-pass search")
+        self.assertIn("topic.title", params["search_query_template"])
+        self.assertEqual(params.get("search_depth"), "advanced")
+        self.assertGreaterEqual(int(params.get("search_max_results", 0)), 5)
+
+    # --- 8) article_writer: temperature lowered ----------------------------
+
+    def test_article_writer_temperature_lowered(self) -> None:
+        from aicrew.seed import ZADNIM_AGENT_CONFIG
+        model, temperature, max_tokens = ZADNIM_AGENT_CONFIG["article_writer"]
+        # Bug: temperature 0.8 invited fabricated "unexpected details".
+        # Fix: 0.4 keeps prose alive without inviting confabulation.
+        self.assertLessEqual(temperature, 0.5,
+                             f"article_writer temperature must be <= 0.5, got {temperature}")
+        # Defensive: not so cold the prose dies.
+        self.assertGreaterEqual(temperature, 0.2)
+
+
 if __name__ == "__main__":
     unittest.main()

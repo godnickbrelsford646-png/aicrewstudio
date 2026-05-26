@@ -147,13 +147,31 @@ class PipelineRunner:
                         "forbidden_topics": forbidden + [c["title"] for c in confirmed]},
             ).output
             cands = gen_out.get("topics", [])
-            val_out = self.executor.run(
-                agent=val_runtime, pipeline_run_id=prid,
-                inputs={"candidate_topics": cands},
-            ).output
-            for v in val_out.get("validated", []):
-                if v.get("is_valid") and v["title"] not in [c["title"] for c in confirmed]:
-                    confirmed.append(v)
+            # Per-candidate validation: we no longer hand the whole batch
+            # to topic_validator with a single generic search query. Each
+            # candidate gets its own validator call with
+            # candidate_topics=[ONE_candidate]. The validator's
+            # search_query_template ("{{ candidate_topics[0].title }}
+            # {{ candidate_topics[0].event_date }}") then renders into a
+            # specific Tavily query per candidate, giving the agent a
+            # WEB SEARCH RESULTS block focused on THAT exact title+date.
+            # The 24h search_cache deduplicates repeated queries (same
+            # candidate hit twice, identical phrasing across retries).
+            #
+            # This is the single biggest anti-hallucination win in the
+            # topic phase: previously the validator searched
+            # "{{ today_md }} historical events fact check" once for the
+            # whole batch and then approved candidates "from memory" if
+            # the date was right. Now every candidate must actually
+            # appear on the web, on the right day, before is_valid=true.
+            for cand in cands:
+                val_out = self.executor.run(
+                    agent=val_runtime, pipeline_run_id=prid,
+                    inputs={"candidate_topics": [cand]},
+                ).output
+                for v in val_out.get("validated", []):
+                    if v.get("is_valid") and v["title"] not in [c["title"] for c in confirmed]:
+                        confirmed.append(v)
             log.info("topic phase: attempt %d/%d -> confirmed=%d / target=%d",
                      attempt + 1, max_retries, len(confirmed), target)
             if len(confirmed) >= target:
@@ -397,6 +415,33 @@ class PipelineRunner:
             inputs={"topic": topic_inputs, "research_validated": brief, "language": lang,
                     "project": project},
         ).output
+        # Fact-audit BEFORE headline_writer/qa_editorial. fact_audit walks
+        # article.body_md, extracts every concrete claim (names, numbers,
+        # quotes, dates) and verifies it against research_validated. If a
+        # claim has no support in the brief, it is removed/rephrased into
+        # `fixed_body_md`. We use the cleaned body as input to the rest of
+        # the chain (headlines, qa_editorial), so any fabricated names or
+        # quotes never reach published posts.
+        # Falls back gracefully if no fact_audit agent is present (e.g.
+        # an old DB pre-migration) — we just skip the step and leave
+        # article_out untouched.
+        fa_agent = agents.get(("fact_audit", lang))
+        fa_out: dict[str, Any] = {}
+        if fa_agent:
+            fa_out = self.executor.run(
+                agent=fa_agent, pipeline_run_id=prid, topic_id=topic["id"],
+                inputs={"article": article_out, "research_validated": brief,
+                        "topic": topic_inputs, "language": lang},
+            ).output
+            fixed_body = fa_out.get("fixed_body_md")
+            if fixed_body:
+                article_out["body_md"] = fixed_body
+            unsupported = fa_out.get("unsupported_claims") or []
+            log.info("topic %s [%s]: fact_audit score=%s must_fix=%s "
+                     "unsupported_claims=%d",
+                     topic["id"], lang,
+                     fa_out.get("score"), fa_out.get("must_fix"),
+                     len(unsupported))
         headline_writer = agents.get(("headline_writer", lang))
         headlines_out = self.executor.run(
             agent=headline_writer, pipeline_run_id=prid, topic_id=topic["id"],
@@ -416,12 +461,29 @@ class PipelineRunner:
                 ),
             )
         # QA editorial (text-only check + headline pick + minimal edits).
+        # We pass research_validated so the new checklist item #0 (the
+        # factcheck pass) can verify that no name/number/quote in the
+        # body sneaks past fact_audit. Even though fact_audit already
+        # ran, qa_editorial provides a literary-second-pair-of-eyes
+        # check that occasionally catches edge cases.
         qa_ed = agents.get(("qa_editorial", lang))
         qa_out = self.executor.run(
             agent=qa_ed, pipeline_run_id=prid, article_id=article_id,
             inputs={"article": article_out, "headlines": headlines_out.get("headlines", []),
-                    "topic": topic_inputs, "language": lang},
+                    "topic": topic_inputs, "language": lang,
+                    "research_validated": brief},
         ).output
+        # Combined QA notes: persist fact_audit findings alongside the
+        # editorial issues so the UI / audit trail can see both.
+        combined_notes: dict[str, Any] = {
+            "issues": qa_out.get("issues", []),
+        }
+        if fa_out:
+            combined_notes["fact_audit"] = {
+                "score": fa_out.get("score"),
+                "must_fix": fa_out.get("must_fix"),
+                "unsupported_claims": fa_out.get("unsupported_claims", []),
+            }
         with db.connect(self.settings.db_path) as conn:
             conn.execute(
                 "UPDATE articles SET chosen_headline=?, body_full=?, "
@@ -430,7 +492,7 @@ class PipelineRunner:
                     qa_out.get("chosen_headline"),
                     qa_out.get("revised_body_md") or article_out.get("body_md", ""),
                     int(qa_out.get("score", 0)),
-                    db.jdump(qa_out.get("issues", [])),
+                    db.jdump(combined_notes),
                     db.now_iso(), article_id,
                 ),
             )

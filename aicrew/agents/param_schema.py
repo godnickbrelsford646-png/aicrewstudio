@@ -252,6 +252,24 @@ QA_EDITORIAL_FIELDS: list[ParamField] = [
 
 
 # ============================================================================
+# 9c. Фактаудит — пост-писательский фактчек
+# ============================================================================
+# Проверяет, что каждое имя/цифра/цитата из готовой статьи действительно
+# присутствует в research_validated. Пороги строже, чем у qa_editorial,
+# потому что один выдуманный факт убивает доверие ко всей статье — а
+# qa_editorial судит только литературное качество.
+FACT_AUDIT_FIELDS: list[ParamField] = [
+    ParamField(
+        key="min_score",
+        label="Минимальная оценка для прохождения фактаудита",
+        hint="0–100. Score = 100 минус penalty по unsupported_claims "
+             "(low=2, med=10, high=25). Если ниже — must_fix=true.",
+        type="int", default=80, min=0, max=100,
+    ),
+]
+
+
+# ============================================================================
 # 9b. QA визуальный — нет настраиваемых параметров
 # ============================================================================
 QA_VISUAL_FIELDS: list[ParamField] = []
@@ -420,6 +438,7 @@ PARAM_SCHEMAS: dict[str, list[ParamField]] = {
     "headline_writer":     HEADLINE_WRITER_FIELDS,
     "image_prompt_writer": IMAGE_PROMPT_WRITER_FIELDS,
     "qa_editorial":        QA_EDITORIAL_FIELDS,
+    "fact_audit":          FACT_AUDIT_FIELDS,
     "qa_visual":           QA_VISUAL_FIELDS,
     "channel_rewriter":    CHANNEL_REWRITER_FIELDS,
     "video_scenarist":     VIDEO_SCENARIST_FIELDS,
