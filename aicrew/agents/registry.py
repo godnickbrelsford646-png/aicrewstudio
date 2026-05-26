@@ -1003,3 +1003,68 @@ def default_agents_for_project(language_modes: list[str]) -> list[dict[str, Any]
                 "spec": spec,
             })
     return out
+
+
+# ---- Teams -----------------------------------------------------------------
+# A "team" is a group of agents responsible for one content level + one
+# language. The supported team ids are:
+#   text_ru / text_en   — editorial team writing articles in that language
+#                         (researcher, research_validator, article_writer,
+#                          headline_writer, qa_editorial)
+#   video_ru / video_en — video production team for that language
+#                         (video_scenarist, voice_director, subtitle_styler)
+# Plus two "categories" that are NOT teams in the toggle sense:
+#   None                — global agents (one per project regardless of lang),
+#                         e.g. topic_generator, image_prompt_writer, qa_visual,
+#                         video_keyframe_artist, video_assembler
+#   "rewriter"          — channel_rewriter (one per text channel)
+# Mapping role -> team kind ("text", "video"), or None for globals.
+TEAM_KIND_FOR_ROLE: dict[str, str | None] = {
+    # text editorial team
+    "researcher":          "text",
+    "research_validator":  "text",
+    "article_writer":      "text",
+    "headline_writer":     "text",
+    "qa_editorial":        "text",
+    # video production team
+    "video_scenarist":     "video",
+    "voice_director":      "video",
+    "subtitle_styler":     "video",
+    # globals (no team)
+    "topic_generator":      None,
+    "topic_validator":      None,
+    "topic_ranker":         None,
+    "image_prompt_writer":  None,
+    "qa_visual":            None,
+    "video_keyframe_artist": None,
+    "video_assembler":      None,
+    "channel_rewriter":     None,
+}
+
+
+def team_id_for(role: str, language: str | None) -> str | None:
+    """Resolve a role+language pair to a team identifier.
+
+    Returns 'text_ru', 'text_en', 'video_ru', 'video_en', or None for
+    project-wide (global) roles and for the rewriter (which is per-channel,
+    not per-team).
+    """
+    kind = TEAM_KIND_FOR_ROLE.get(role)
+    if kind is None:
+        return None
+    if language in (None, "", "bi"):
+        return None
+    return f"{kind}_{language}"
+
+
+def default_enabled_teams(language_modes: list[str]) -> list[str]:
+    """Default ``enabled_teams`` for a project given its languages.
+
+    Every (kind, lang) pair where lang is in ``language_modes`` is enabled
+    by default; the user can later toggle individual teams off in the
+    project's Settings tab.
+    """
+    teams: list[str] = []
+    for lang in language_modes:
+        teams.extend([f"text_{lang}", f"video_{lang}"])
+    return teams

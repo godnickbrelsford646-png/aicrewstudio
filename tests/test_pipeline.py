@@ -513,5 +513,108 @@ class VideoPhaseTest(unittest.TestCase):
         self.assertGreater(os.path.getsize(final_path), 0)
 
 
+class EnabledTeamsTest(unittest.TestCase):
+    """The enabled_teams toggle must gate the article and video phases.
+
+    With only text_ru enabled:
+      - run_article_phase produces RU articles only (text_en is off);
+      - run_video_phase on any article fails (video_ru and video_en
+        are both off).
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_teams_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "teams.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        for k in ("AI302_API_KEY", "OPENAI_API_KEY"):
+            os.environ.pop(k, None)
+        self.settings = load_settings()
+
+    def test_disabled_text_team_skips_language(self) -> None:
+        info = seed(self.settings)
+        # Disable everything except text_ru. Seed creates a project with
+        # all four teams enabled; we patch the column directly to simulate
+        # the user clicking three of them off in the Settings tab.
+        with db.connect(self.settings.db_path) as conn:
+            conn.execute(
+                "UPDATE projects SET enabled_teams=? WHERE id=?",
+                (json.dumps(["text_ru"]), info["project_id"]),
+            )
+        runner = PipelineRunner(self.settings)
+        runner.run_topic_phase(info["project_id"])
+        article_ids = runner.run_article_phase(info["project_id"])
+        # Articles must all be Russian — text_en is disabled.
+        with db.connect(self.settings.db_path) as conn:
+            langs = [r["language"] for r in conn.execute(
+                "SELECT language FROM articles WHERE project_id=?",
+                (info["project_id"],),
+            ).fetchall()]
+        self.assertTrue(article_ids, "expected at least one article")
+        self.assertTrue(
+            all(l == "ru" for l in langs),
+            f"expected only ru articles; got {langs}",
+        )
+        # Video phase must refuse to run on a RU article because
+        # video_ru is disabled in the patched enabled_teams list.
+        ru_article = article_ids[0]
+        with self.assertRaises(RuntimeError) as cm:
+            runner.run_video_phase(ru_article)
+        msg = str(cm.exception).lower()
+        self.assertIn("video team", msg)
+        self.assertIn("disabled", msg)
+
+
+class TopicCycleEarlyStopTest(unittest.TestCase):
+    """Re-running run_topic_phase against the same DB exercises the
+    forbidden-titles + early-stop interaction.
+
+    The mock generator is largely deterministic, so the second pass —
+    with the entire first batch already in forbidden_topics — produces
+    very few (often zero) new accepted titles. The early-stop logic
+    must keep the total topic count bounded; we explicitly do NOT
+    require the second pass to find anything new (per the steering
+    note: that's a valid outcome).
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_earlystop_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "earlystop.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        self.settings = load_settings()
+
+    def test_second_run_does_not_explode_topic_count(self) -> None:
+        info = seed(self.settings)
+        runner = PipelineRunner(self.settings)
+        runner.run_topic_phase(info["project_id"])
+        with db.connect(self.settings.db_path) as conn:
+            first = conn.execute(
+                "SELECT COUNT(*) c FROM topics WHERE project_id=?",
+                (info["project_id"],),
+            ).fetchone()["c"]
+        self.assertGreater(first, 0, "first run produced no topics")
+        # Second pass: forbidden_titles already covers everything from
+        # the first run, so the generator must produce few or no new
+        # titles. The early-stop guard prevents the loop from spinning
+        # max_retries times. Loose upper bound: the topic count must
+        # not more than double — if it did, the early-stop would have
+        # been bypassed and we'd be regenerating duplicates indefinitely.
+        runner.run_topic_phase(info["project_id"])
+        with db.connect(self.settings.db_path) as conn:
+            second = conn.execute(
+                "SELECT COUNT(*) c FROM topics WHERE project_id=?",
+                (info["project_id"],),
+            ).fetchone()["c"]
+        self.assertLessEqual(
+            second, first * 2,
+            f"topic count grew unreasonably: first={first} second={second}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from . import db
-from .agents.registry import default_agents_for_project, role_spec
+from .agents.registry import default_agents_for_project, default_enabled_teams, role_spec
 from .channels.registry import CHANNEL_KINDS
 from .crypto import encrypt
 from .settings import Settings
@@ -617,6 +617,12 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "до 3–5 предложений. Добавь конкретные детали (имя, место, "
         "точная цифра, цитата) — то, что отличает живую историю от "
         "строчки в энциклопедии.\n\n"
+        "ШАГ 4 — ДЕДУП. Если в списке кандидатов две темы про ОДНО И "
+        "ТО ЖЕ событие (одинаковая дата + одинаковый протагонист или "
+        "сюжет) — оставь ПЕРВУЮ, остальные пометь is_valid=false с "
+        "reject_reason='duplicate'. Например, «Премьера фильма "
+        "Звёздные войны» и «Первый показ Звёздных войн» — это одно "
+        "событие, оставь одну формулировку.\n\n"
         "ОТКЛОНЯЙ темы где:\n"
         "- event_date ≠ {{ today_md }} (день+месяц).\n"
         "- Один источник, один автор, один сайт.\n"
@@ -659,6 +665,12 @@ ZADNIM_PROMPTS: dict[str, str] = {
         "summary to 3–5 sentences. Add concrete details (name, place, "
         "exact figure, quote) — what separates a living story from an "
         "encyclopedia line.\n\n"
+        "STEP 4 — DEDUPLICATION. If two candidates describe the SAME "
+        "event (same date + same protagonist or storyline) — keep the "
+        "FIRST one, mark the rest is_valid=false with "
+        "reject_reason='duplicate'. For example, \"Star Wars film "
+        "premiere\" and \"First showing of Star Wars\" are the same "
+        "event; keep one wording.\n\n"
         "REJECT topics where:\n"
         "- event_date ≠ {{ today_md }} (day+month).\n"
         "- One source, one author, one site.\n"
@@ -1354,46 +1366,66 @@ ZADNIM_PROMPTS: dict[str, str] = {
 
 
 # ---- Video team prompts for "Задним числом" -------------------------------
-# Product-grade overrides for the three video-team roles that benefit from a
-# project-specific voice. The other two new roles (subtitle_styler,
-# video_assembler) keep their generic registry templates — there is nothing
-# project-specific about converting SRT→ASS or stitching MP4s.
+# Product-grade overrides for the four video-team roles that benefit from a
+# project-specific voice. The fifth role (video_assembler) is non-LLM —
+# stitching MP4s happens in tools/video_assembler.py — and keeps its generic
+# stub from registry.py.
+#
+# Each prompt is bilingual via {% if language == 'ru' %} ... {% else %} ...
+# {% endif %} (the mini-templating engine in aicrew/templates.py supports
+# the construct). Length is 200–400 words per language: thinner prompts
+# under-perform on real production runs.
 
 VIDEO_TEAM_PROMPTS: dict[str, str] = {
 
     # ──────────────────────────────────────────────────────────────────────
     # video_scenarist (RU/EN bilingual). Override of the generic registry
     # template with the project's cinematic-historical voice.
+    # School: Erik Larson + BBC documentary writers + @whatifalthist.
     # ──────────────────────────────────────────────────────────────────────
     "video_scenarist": (
         "{% if language == 'ru' %}"
         "Ты — сценарист коротких видео для канала «Задним числом» "
-        "(исторические события). Школа: Эрик Ларсон, Малкольм Гладуэлл. "
-        "Видео — это сцена, не лекция. Зритель должен попасть внутрь "
-        "момента, а не получить пересказ.\n\n"
+        "(исторические события). Школа: Эрик Ларсон + сценаристы BBC "
+        "+ @whatifalthist (TikTok-историки). Видео — это сцена, не "
+        "лекция: зритель должен попасть ВНУТРЬ момента, а не получить "
+        "пересказ.\n\n"
         "ИСХОДНАЯ СТАТЬЯ\n"
         "Заголовок: {{ article.title_working }}\n"
         "TL;DR: {{ article.tldr }}\n"
         "Текст:\n{{ article.body_md }}\n\n"
         "ЗАДАЧА. Преврати статью в короткое вертикальное видео "
-        "({{ params.target_duration_s }} секунд, кадр 9:16).\n\n"
-        "СТРУКТУРА (5–9 сцен, 4–7 секунд каждая):\n"
-        "1. ХУК (1 сцена, ≤5 секунд). Не «сегодня», не дата. "
-        "Парадокс, жест, конкретная деталь.\n"
-        "2. КОНТЕКСТ (1 сцена). Кто герой, что было на кону.\n"
-        "3. РАЗВИТИЕ (3–5 сцен). Что произошло, в какой "
+        "({{ params.target_duration_s }} секунд, формат 9:16).\n\n"
+        "ТРЁХСЕКУНДНОЕ ПРАВИЛО. Первые 3 секунды решают всё: если "
+        "не зацепили — зритель свайпнул. Хук НЕ начинается с даты, "
+        "цифры, «как известно», «давным-давно». Начинай со сцены, "
+        "жеста, парадокса, конкретной детали.\n\n"
+        "СТРУКТУРА (5–9 сцен, 4–7 секунд каждая, ритм 1-3-2-1):\n"
+        "1. ХУК (1 сцена, ≤3 сек) — самая шокирующая фраза или "
+        "образ.\n"
+        "2. РАЗОГРЕВ (1–2 сцены) — кто герой, что было на кону.\n"
+        "3. ПИК (3–4 сцены) — что произошло, в какой "
         "последовательности. Дата события упоминается в одной из этих "
-        "сцен дословно — один раз.\n"
-        "4. НЕОЖИДАННАЯ ДЕТАЛЬ (1 сцена). Тот самый момент «не может "
-        "быть».\n"
-        "5. ФИНАЛ (1 сцена). Сильная смысловая точка. "
-        "НЕ «подписывайтесь».\n\n"
+        "сцен ДОСЛОВНО — ровно один раз.\n"
+        "4. ТОЧКА (1 сцена) — сильный финальный кадр или вопрос. НЕ "
+        "«подписывайтесь».\n\n"
+        "ЗВУКОВАЯ ДРАМАТУРГИЯ. Сцены НЕ равны по интенсивности: хук "
+        "— обрыв, разогрев — спокойствие, пик — нарастание, точка — "
+        "тишина. Это считывается через voiceover (короткие фразы в "
+        "пике, длинная — в финале).\n\n"
         "ПРАВИЛА КАЖДОЙ СЦЕНЫ:\n"
-        "- voiceover: одна-две короткие фразы, ≤15 знаков/секунду.\n"
+        "- voiceover: одна-две короткие фразы. ЖЁСТКИЙ ПОТОЛОК — "
+        "16 знаков на секунду (то есть 4 сек = ≤64 символа).\n"
         "- on_screen_text: 1–4 слова, крупно, без точки.\n"
         "- b_roll_idea: конкретный кадр (крупный план рук, дым над "
-        "крышей, один предмет на столе).\n"
+        "крышей, один предмет на столе). НЕ «эпичный план», НЕ "
+        "«красивая картинка».\n"
         "- duration_s: 4.0–7.0.\n\n"
+        "АНТИ-ПАТТЕРНЫ:\n"
+        "- Начало с даты или «{{ today_md }}…».\n"
+        "- Больше 9 сцен (зритель потеряется).\n"
+        "- voiceover длиннее 16 знаков/сек (TTS не успеет).\n"
+        "- CTA «подписывайтесь, ставьте лайк» — мгновенный отказ.\n\n"
         "Стиль: {{ params.style_preset }}.\n\n"
         "Верни JSON:\n"
         '{ "hook": str, "scenes": [ {"idx": int, "voiceover": str, '
@@ -1401,30 +1433,47 @@ VIDEO_TEAM_PROMPTS: dict[str, str] = {
         '"duration_s": number} ], "cta": str }'
         "{% else %}"
         "You are a short-video writer for the \"Backdated\" channel "
-        "(historical events). School: Erik Larson, Malcolm Gladwell. "
-        "A video is a scene, not a lecture. The viewer must enter the "
-        "moment, not be told about it.\n\n"
+        "(historical events). School: Erik Larson + BBC documentary "
+        "writers + @whatifalthist (TikTok historians). A video is a "
+        "scene, not a lecture — the viewer must enter the moment, not "
+        "be told about it.\n\n"
         "SOURCE ARTICLE\n"
         "Headline: {{ article.title_working }}\n"
         "TL;DR: {{ article.tldr }}\n"
         "Body:\n{{ article.body_md }}\n\n"
         "TASK. Turn the article into a short vertical video "
         "({{ params.target_duration_s }} seconds, 9:16 frame).\n\n"
-        "STRUCTURE (5–9 scenes, 4–7 seconds each):\n"
-        "1. HOOK (1 scene, ≤5 sec). Not \"today\", not a date. "
-        "Paradox, gesture, concrete detail.\n"
-        "2. CONTEXT (1 scene). Hero + stakes.\n"
-        "3. DEVELOPMENT (3–5 scenes). What happened, in what order. "
-        "The exact event date appears verbatim in ONE of these scenes.\n"
-        "4. UNEXPECTED DETAIL (1 scene). The \"no way\" moment.\n"
-        "5. ENDING (1 scene). A strong meaningful close. "
-        "NOT \"subscribe\".\n\n"
+        "THREE-SECOND RULE. The first 3 seconds decide everything: "
+        "miss them and the viewer is gone. The hook does NOT start "
+        "with a date, a number, \"as we all know\" or \"long ago\". "
+        "Open with a scene, a gesture, a paradox, a specific "
+        "detail.\n\n"
+        "STRUCTURE (5–9 scenes, 4–7 seconds each, rhythm 1-3-2-1):\n"
+        "1. HOOK (1 scene, ≤3 sec) — the most shocking phrase or "
+        "image.\n"
+        "2. WARM-UP (1–2 scenes) — hero + stakes.\n"
+        "3. PEAK (3–4 scenes) — what happened, in what order. The "
+        "exact event date appears VERBATIM in ONE of these scenes — "
+        "exactly once.\n"
+        "4. CLOSE (1 scene) — a strong final shot or question. NOT "
+        "\"subscribe\".\n\n"
+        "SONIC DRAMA. Scenes are NOT equal in intensity: hook = "
+        "rupture, warm-up = stillness, peak = build, close = silence. "
+        "This is encoded in the voiceover (short phrases at the peak, "
+        "a long line at the close).\n\n"
         "PER-SCENE RULES:\n"
-        "- voiceover: one or two short sentences, ≤15 chars/sec.\n"
+        "- voiceover: one or two short sentences. HARD CAP — 17 "
+        "characters per second (so 4 sec = ≤68 characters).\n"
         "- on_screen_text: 1–4 words, big, no period.\n"
         "- b_roll_idea: a specific shot (a close-up of hands, smoke "
-        "above a roof, one object on a table).\n"
+        "above a roof, one object on a table). NOT \"an epic shot\", "
+        "NOT \"a beautiful picture\".\n"
         "- duration_s: 4.0–7.0.\n\n"
+        "ANTI-PATTERNS:\n"
+        "- Opening with a date or \"{{ today_md }}…\".\n"
+        "- More than 9 scenes (viewer is lost).\n"
+        "- voiceover faster than 17 chars/sec (TTS will not keep up).\n"
+        "- CTA \"subscribe, hit like\" — instant fail.\n\n"
         "Style: {{ params.style_preset }}.\n\n"
         "Return JSON:\n"
         '{ "hook": str, "scenes": [ {"idx": int, "voiceover": str, '
@@ -1435,52 +1484,101 @@ VIDEO_TEAM_PROMPTS: dict[str, str] = {
 
     # ──────────────────────────────────────────────────────────────────────
     # video_keyframe_artist (GLOBAL/bi). English-leaning prompts since
-    # video models prefer English; the {% if %} switch only changes the
-    # surrounding instructions, not the prompt language.
+    # image/video models prefer English; the {% if %} switch only changes
+    # the surrounding instructions to the team, the prompts stay English.
+    # School: Roger Deakins / Emmanuel Lubezki / Greig Fraser, accent on
+    # MOTION (one approved camera move per scene).
     # ──────────────────────────────────────────────────────────────────────
     "video_keyframe_artist": (
         "{% if language == 'ru' %}"
-        "Ты — концепт-художник для исторического канала «Задним "
-        "числом». Школа: Roger Deakins (1917), Emmanuel Lubezki "
-        "(The Revenant), Greig Fraser (Dune). Каждый кадр — "
-        "конкретный момент, который можно сфотографировать.\n\n"
+        "Ты — концепт-художник проекта «Задним числом». Школа: Roger "
+        "Deakins (1917, Skyfall), Emmanuel Lubezki (The Revenant, "
+        "Birdman), Greig Fraser (Dune). Ты думаешь кадрами, светом и "
+        "достоверной деталью эпохи. Видео-модель ждёт ОДНОГО движения "
+        "на сцену — никакого монтажа внутри одного шота.\n\n"
         "ЗАДАЧА. Для каждой сцены сценария напиши ДВА промта НА "
-        "АНГЛИЙСКОМ (image-модели лучше понимают английский):\n"
-        "  - image_prompt: статичный кадр 9:16. Подлежащее, "
-        "свет, эпоха, композиция, настроение, кинематографический "
-        "стиль.\n"
-        "  - i2v_prompt: одно простое движение камеры или объекта "
-        "(slow zoom in, camera pans left, parallax tilt up, "
-        "subtle dolly forward).\n\n"
-        "ПРАВИЛА:\n"
-        "- НИКАКИХ современных предметов в исторической эпохе.\n"
-        "- НИКАКОГО текста и надписей в кадре (image-модели не "
-        "умеют рендерить текст).\n"
-        "- Стиль: {{ params.style_preset }}.\n"
-        "- Соотношение сторон: 9:16 (зашито).\n\n"
-        "Сцены: {{ scenes }}\n\n"
+        "АНГЛИЙСКОМ (image/video-модели лучше понимают английский):\n"
+        "  - image_prompt: статичный кадр 9:16. 6 элементов:\n"
+        "      1) SUBJECT — конкретный человек/объект/сцена;\n"
+        "      2) PERIOD — одежда, реквизит, архитектура эпохи;\n"
+        "      3) LIGHT — направление, качество, время дня "
+        "(\"low afternoon sun, side-light\");\n"
+        "      4) COMPOSITION — правило третей, ведущие линии, "
+        "глубина;\n"
+        "      5) MOOD — одно конкретное эмоциональное слово "
+        "(tension, resignation, dread);\n"
+        "      6) STYLE — \"cinematic photography, 35mm film grain, "
+        "shallow DoF\".\n"
+        "  - i2v_prompt: ОДНО простое движение из списка ниже. Не "
+        "больше одного движения на сцену.\n\n"
+        "ОДОБРЕННЫЕ ДВИЖЕНИЯ КАМЕРЫ (выбери одно):\n"
+        "  • slow zoom in            — нарастание напряжения\n"
+        "  • slow zoom out           — финальный план-откровение\n"
+        "  • camera pans left        — визуальная хронология (раньше)\n"
+        "  • camera pans right       — визуальная хронология (позже)\n"
+        "  • subtle parallax         — статичный кадр с глубиной\n"
+        "  • tilt up slowly          — драматическое раскрытие\n"
+        "  • dolly forward           — вход в сцену\n\n"
+        "АНТИ-ПАТТЕРНЫ:\n"
+        "  - Монтаж в одном шоте (cut, jump cut, multi-shot).\n"
+        "  - Поворот камеры на 360°, генерация новых персонажей или "
+        "смена кадра внутри клипа.\n"
+        "  - Текст и буквы в кадре (image-модели их галлюцинируют).\n"
+        "  - Современные предметы (смартфоны, пластик, логотипы) в "
+        "исторической эпохе.\n"
+        "  - Несколько движений в i2v_prompt (\"zoom in then pan\").\n\n"
+        "ОБЯЗАТЕЛЬНО оба поля для каждой сцены, idx совпадает с "
+        "scenes[i].idx.\n"
+        "Стиль: {{ params.style_preset }}. Соотношение 9:16.\n\n"
+        "Сцены: {{ scenes }}\n"
+        "Article TLDR: {{ article.tldr }}\n\n"
         "Верни JSON:\n"
         '{ "keyframes": [ {"idx": int, "image_prompt": str, '
         '"i2v_prompt": str} ] }'
         "{% else %}"
         "You are a concept artist for the historical channel "
-        "\"Backdated\". School: Roger Deakins (1917), Emmanuel "
-        "Lubezki (The Revenant), Greig Fraser (Dune). Every frame is "
-        "a specific photographable moment.\n\n"
+        "\"Backdated\". School: Roger Deakins (1917, Skyfall), "
+        "Emmanuel Lubezki (The Revenant, Birdman), Greig Fraser "
+        "(Dune). You think in frames, light and period-accurate "
+        "detail. The video model expects ONE motion per scene — no "
+        "montage inside a single shot.\n\n"
         "TASK. For each scenario scene, write TWO prompts in "
-        "ENGLISH (image models prefer English):\n"
-        "  - image_prompt: a still 9:16 frame. Subject, light, era, "
-        "composition, mood, cinematic style.\n"
-        "  - i2v_prompt: one simple camera or subject motion "
-        "(slow zoom in, camera pans left, parallax tilt up, subtle "
-        "dolly forward).\n\n"
-        "RULES:\n"
-        "- NO modern objects in a historical era.\n"
-        "- NO legible text or letters in the frame (image models "
-        "cannot render text).\n"
-        "- Style: {{ params.style_preset }}.\n"
-        "- Aspect ratio: 9:16 (locked).\n\n"
-        "Scenes: {{ scenes }}\n\n"
+        "ENGLISH (image/video models prefer English):\n"
+        "  - image_prompt: a still 9:16 frame. 6 elements:\n"
+        "      1) SUBJECT — a specific person/object/scene;\n"
+        "      2) PERIOD — era-correct clothing, props, architecture;\n"
+        "      3) LIGHT — direction, quality, time of day "
+        "(\"low afternoon sun, side-light\");\n"
+        "      4) COMPOSITION — rule of thirds, leading lines, "
+        "depth;\n"
+        "      5) MOOD — one concrete emotional word "
+        "(tension, resignation, dread);\n"
+        "      6) STYLE — \"cinematic photography, 35mm film grain, "
+        "shallow DoF\".\n"
+        "  - i2v_prompt: ONE simple motion from the list below. No "
+        "more than one motion per scene.\n\n"
+        "APPROVED CAMERA MOVES (pick one):\n"
+        "  • slow zoom in            — building tension\n"
+        "  • slow zoom out           — final reveal\n"
+        "  • camera pans left        — visual chronology (earlier)\n"
+        "  • camera pans right       — visual chronology (later)\n"
+        "  • subtle parallax         — still frame with depth\n"
+        "  • tilt up slowly          — dramatic reveal\n"
+        "  • dolly forward           — entering the scene\n\n"
+        "ANTI-PATTERNS:\n"
+        "  - Montage inside one shot (cut, jump cut, multi-shot).\n"
+        "  - 360° camera rotation, new characters appearing, frame "
+        "changes mid-clip.\n"
+        "  - Legible text or letters in the frame (image models "
+        "hallucinate text).\n"
+        "  - Modern objects (smartphones, plastic, logos) in a "
+        "historical era.\n"
+        "  - Multiple motions in i2v_prompt (\"zoom in then pan\").\n\n"
+        "BOTH fields ARE REQUIRED for every scene; idx must match "
+        "scenes[i].idx.\n"
+        "Style: {{ params.style_preset }}. Aspect 9:16.\n\n"
+        "Scenes: {{ scenes }}\n"
+        "Article TLDR: {{ article.tldr }}\n\n"
         "Return JSON:\n"
         '{ "keyframes": [ {"idx": int, "image_prompt": str, '
         '"i2v_prompt": str} ] }'
@@ -1488,26 +1586,38 @@ VIDEO_TEAM_PROMPTS: dict[str, str] = {
     ),
 
     # ──────────────────────────────────────────────────────────────────────
-    # voice_director (per-language). Tone of speech, SSML breaks,
-    # length cap per scene.duration_s.
+    # voice_director (per-language). School: BBC documentary narration /
+    # Юрий Левитан / Vladimir Pozner. Sets diction, tempo, SSML breaks
+    # and a hard length cap per scene.duration_s.
     # ──────────────────────────────────────────────────────────────────────
     "voice_director": (
         "{% if language == 'ru' %}"
         "Ты — режиссёр озвучки канала «Задним числом». Школа: "
-        "озвучка документалок BBC. Тон сдержанный, кинематографичный, "
-        "без пафоса. Голос {{ params.voice_id }}, скорость "
-        "{{ params.speed }}.\n\n"
-        "ЗАДАЧА. Подгони закадровый текст под длительность каждой "
-        "сцены и расставь паузы.\n\n"
-        "ПРАВИЛА:\n"
-        "- Темп ≈15 знаков в секунду. Если voiceover не влезает в "
-        "scene.duration_s — сократи, оставив главное.\n"
-        "- На границах фраз вставляй SSML-паузу "
-        "<break time=\"300ms\"/>. На точке между смысловыми "
-        "блоками — <break time=\"500ms\"/>.\n"
-        "- Не убирай дату события, если она была.\n"
-        "- estimated_duration_s — реальная длительность с учётом "
-        "пауз.\n\n"
+        "документалки BBC, Юрий Левитан, голоса «Намедни». Тон "
+        "сдержанный, кинематографичный — ни патетики, ни иронии. "
+        "Голос: {{ params.voice_id }}, скорость {{ params.speed }}.\n\n"
+        "ЗАДАЧА. Подгоняешь закадровый текст под длительность каждой "
+        "сцены и ставишь дикцию через SSML-паузы.\n\n"
+        "КОНТРАКТ ДЛИНЫ. Жёсткий потолок — 15 знаков в секунду "
+        "(русский медленнее английского). Если voiceover не влезает "
+        "в scene.duration_s — СОКРАТИ, сохранив главное:\n"
+        "  - дату события НИКОГДА не теряй;\n"
+        "  - имя ключевого героя НИКОГДА не теряй;\n"
+        "  - детали и эпитеты режутся первыми.\n\n"
+        "SSML-ПАУЗЫ (используй ровно так):\n"
+        "  • <break time=\"200ms\"/> — между фразами одной мысли;\n"
+        "  • <break time=\"400ms\"/> — на смене сцены, "
+        "эмоциональном переходе;\n"
+        "  • <break time=\"600ms\"/> — перед финальной фразой.\n"
+        "Не больше 3 пауз на сцену. Никогда не ставь SSML внутрь "
+        "слова или между двумя пробелами.\n\n"
+        "АНТИ-ПАТТЕРНЫ:\n"
+        "  - Парафраз исходного текста (НЕ меняй смысл).\n"
+        "  - Добавление CTA («подписывайтесь», «узнайте больше»).\n"
+        "  - Восклицания, эмоции, актёрская игра в тексте — голос "
+        "должен быть ровный и собранный.\n"
+        "  - estimated_duration_s, не учитывающее SSML — реальная "
+        "длительность с учётом всех пауз.\n\n"
         "Сцены: {{ scenes }}\n\n"
         "Верни JSON:\n"
         '{ "scenes_normalized": [ {"idx": int, '
@@ -1515,24 +1625,122 @@ VIDEO_TEAM_PROMPTS: dict[str, str] = {
         'number} ] }'
         "{% else %}"
         "You are the voice director of the \"Backdated\" channel. "
-        "School: BBC documentary narration. Tone: restrained, "
-        "cinematic, no pathos. Voice {{ params.voice_id }}, speed "
+        "School: BBC documentary narration, Vladimir Pozner, the "
+        "Frontline narrator. Tone: restrained, cinematic — no pathos, "
+        "no irony. Voice: {{ params.voice_id }}, speed "
         "{{ params.speed }}.\n\n"
-        "TASK. Fit the voiceover to each scene's duration and place "
-        "the breaks.\n\n"
-        "RULES:\n"
-        "- Pace ≈15 chars per second. If voiceover does not fit "
-        "scene.duration_s — trim, keep the essential.\n"
-        "- Insert SSML breaks at phrase boundaries: "
-        "<break time=\"300ms\"/>. Between meaningful blocks: "
-        "<break time=\"500ms\"/>.\n"
-        "- Do not remove the event date if it was in the scene.\n"
-        "- estimated_duration_s — actual duration including breaks.\n\n"
+        "TASK. Fit the voiceover to each scene's duration and shape "
+        "the diction with SSML breaks.\n\n"
+        "LENGTH CONTRACT. Hard cap — 17 characters per second "
+        "(English is faster than Russian). If voiceover does not fit "
+        "scene.duration_s — TRIM, keeping the essentials:\n"
+        "  - the event date is NEVER dropped;\n"
+        "  - the key hero's name is NEVER dropped;\n"
+        "  - details and adjectives are cut first.\n\n"
+        "SSML BREAKS (use exactly like this):\n"
+        "  • <break time=\"200ms\"/> — between phrases of one "
+        "thought;\n"
+        "  • <break time=\"400ms\"/> — on a scene change or "
+        "emotional pivot;\n"
+        "  • <break time=\"600ms\"/> — before the closing sentence.\n"
+        "No more than 3 breaks per scene. Never place SSML inside a "
+        "word or between two spaces.\n\n"
+        "ANTI-PATTERNS:\n"
+        "  - Paraphrasing the source (do NOT change meaning).\n"
+        "  - Adding a CTA (\"subscribe\", \"learn more\").\n"
+        "  - Exclamations, emotion, theatrical line readings — the "
+        "voice must be even and composed.\n"
+        "  - estimated_duration_s ignoring SSML — must be the real "
+        "duration including all breaks.\n\n"
         "Scenes: {{ scenes }}\n\n"
         "Return JSON:\n"
         '{ "scenes_normalized": [ {"idx": int, '
         '"voiceover_normalized": str, "estimated_duration_s": '
         'number} ] }'
+        "{% endif %}"
+    ),
+
+    # ──────────────────────────────────────────────────────────────────────
+    # subtitle_styler (per-language). School: typography leads at Apple
+    # TV+ / A24 / Vox. Subtitles in vertical short-form are the SECOND
+    # visual layer, not just a transcript.
+    # Input: SRT from Whisper. Output: ASS with styled events.
+    # ──────────────────────────────────────────────────────────────────────
+    "subtitle_styler": (
+        "{% if language == 'ru' %}"
+        "Ты — typography lead уровня Apple TV+ / A24 / Vox. В "
+        "коротком вертикальном видео субтитры — это ВТОРОЙ "
+        "ВИЗУАЛЬНЫЙ СЛОЙ, а не просто транскрипт. Их видно на "
+        "беззвуке, они держат ритм и расставляют акценты.\n\n"
+        "ВХОД: SRT-субтитры от Whisper (`srt_text`). Тайминги — "
+        "СТРОГО ИЗ SRT, не модифицируй их. Можно лишь разбить "
+        "длинную строку на 2 строки, если она длиннее 32 символов.\n\n"
+        "ПРИНЦИПЫ ОФОРМЛЕНИЯ:\n"
+        "  • Шрифт: {{ params.font }} — крупный, плотный, "
+        "читается на маленьком экране.\n"
+        "  • Цвет: {{ params.color }} — высокий контраст к фону.\n"
+        "  • Размер: {{ params.font_size }}pt — занимает 6–8% "
+        "высоты кадра.\n"
+        "  • Положение: {{ params.position }} — bottom_center "
+        "для большинства, middle для cover-стиля.\n\n"
+        "{% if params.highlight_keywords %}"
+        "ВЫДЕЛЕНИЕ КЛЮЧЕВЫХ СЛОВ:\n"
+        "  • Подсвечивай 3–5 КЛЮЧЕВЫХ слов на сцену (имена, "
+        "числа, существительные действия) — не больше.\n"
+        "  • Цвет подсветки: #FFD400 (золотой), размер +20%.\n"
+        "  • НЕ подсвечивай предлоги, артикли, союзы, местоимения.\n"
+        "  • НЕ подсвечивай всю строку.\n"
+        "{% endif %}\n"
+        "АНТИ-ПАТТЕРНЫ:\n"
+        "  - Менять текст субтитров (оставляй как есть из SRT).\n"
+        "  - Добавлять эмодзи, символы или ASCII-арт.\n"
+        "  - Использовать комический шрифт (Comic Sans, Papyrus).\n"
+        "  - Кричащий цвет фона или красный текст (читается как "
+        "ошибка).\n"
+        "  - Менять тайминги SRT.\n\n"
+        "ВЫХОД: единая строка ASS-файла со стилем Default и "
+        "событиями Dialogue, по одному на каждый SRT-блок.\n\n"
+        "SRT-вход:\n{{ srt_text }}\n\n"
+        "Верни JSON:\n"
+        '{ "ass_text": str }'
+        "{% else %}"
+        "You are a typography lead at the level of Apple TV+ / A24 / "
+        "Vox. In short-form vertical video, subtitles are the SECOND "
+        "VISUAL LAYER, not just a transcript. They are visible on "
+        "mute, hold the rhythm and place the accents.\n\n"
+        "INPUT: SRT subtitles from Whisper (`srt_text`). Timings — "
+        "STRICTLY FROM SRT, do not modify. You may only split a long "
+        "line into 2 lines when it exceeds 32 characters.\n\n"
+        "DESIGN PRINCIPLES:\n"
+        "  • Font: {{ params.font }} — big, dense, readable on a "
+        "small screen.\n"
+        "  • Colour: {{ params.color }} — high contrast against the "
+        "background.\n"
+        "  • Size: {{ params.font_size }}pt — occupies 6–8% of the "
+        "frame height.\n"
+        "  • Position: {{ params.position }} — bottom_center for "
+        "most, middle for cover-style.\n\n"
+        "{% if params.highlight_keywords %}"
+        "KEYWORD HIGHLIGHTING:\n"
+        "  • Highlight 3–5 KEY words per scene (names, numbers, "
+        "action nouns) — no more.\n"
+        "  • Highlight colour: #FFD400 (gold), size +20%.\n"
+        "  • Do NOT highlight prepositions, articles, conjunctions, "
+        "pronouns.\n"
+        "  • Do NOT highlight the whole line.\n"
+        "{% endif %}\n"
+        "ANTI-PATTERNS:\n"
+        "  - Changing subtitle text (keep it as is from SRT).\n"
+        "  - Adding emoji, symbols or ASCII art.\n"
+        "  - Using a comic font (Comic Sans, Papyrus).\n"
+        "  - Loud background colour or red body text (reads as an "
+        "error).\n"
+        "  - Modifying SRT timings.\n\n"
+        "OUTPUT: a single ASS file string with a Default style and "
+        "Dialogue events, one per SRT block.\n\n"
+        "SRT input:\n{{ srt_text }}\n\n"
+        "Return JSON:\n"
+        '{ "ass_text": str }'
         "{% endif %}"
     ),
 }
@@ -1556,6 +1764,14 @@ ZADNIM_AGENT_CONFIG: dict[str, tuple[str, float, int]] = {
     "qa_visual":            ("openai:gpt-4o-mini", 0.2, 400),
     "channel_rewriter":     ("openai:gpt-4o-mini", 0.6, 2000),
     "video_scenarist":      ("openai:gpt-4o", 0.7, 2500),
+    # Video team — technical roles, not creative ones; gpt-4o-mini is enough
+    # and the cost difference vs gpt-4o is ~10x. Temperatures match the task:
+    # creative-but-bounded (keyframe artist) gets 0.7, mechanical normalizer
+    # (voice director) and styling translator (subtitle styler) get low temps.
+    "video_keyframe_artist": ("openai:gpt-4o-mini", 0.7, 1500),
+    "voice_director":        ("openai:gpt-4o-mini", 0.4, 2000),
+    "subtitle_styler":       ("openai:gpt-4o-mini", 0.3, 2500),
+    "video_assembler":       ("openai:gpt-4o-mini", 0.0, 200),
 }
 
 # Agent params overrides
@@ -1663,8 +1879,8 @@ def seed(settings: Settings) -> dict[str, str]:
         conn.execute(
             "INSERT INTO projects (id, user_id, slug, name, niche, description, is_enabled, "
             "timezone, language_modes, daily_topics_target, daily_articles_target, "
-            "budget_usd_month, style_guide, created_at, updated_at) VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "budget_usd_month, style_guide, enabled_teams, created_at, updated_at) VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 project_id, user_id, project_slug, DEMO_PROJECT_NAME,
                 "история / события дня / культура / судьбы людей",
@@ -1677,6 +1893,7 @@ def seed(settings: Settings) -> dict[str, str]:
                 "без канцелярита, без воды. Текст должен ощущаться как рассказ хорошего "
                 "рассказчика. Короткие абзацы. Начинать с крючка, не с даты. "
                 "Финал — сильная смысловая точка.",
+                json.dumps(default_enabled_teams(["ru", "en"])),
                 db.now_iso(), db.now_iso(),
             ),
         )

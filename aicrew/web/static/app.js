@@ -46,6 +46,33 @@ function toast(message, kind = "success") {
 
 // ---------- словари ---------------------------------------------------------
 
+// Team metadata: each team has a label, an icon and a primary language.
+// The id is the same as project.enabled_teams entries (text_ru / text_en /
+// video_ru / video_en). Used by the Agents tab to group cards and by the
+// Settings tab to render checkboxes.
+const TEAM_RU = {
+  text_ru:  { label: "Команда статей · Русская",   icon: "📝", lang: "ru" },
+  text_en:  { label: "Команда статей · English",   icon: "📝", lang: "en" },
+  video_ru: { label: "Команда видео · Русская",    icon: "🎬", lang: "ru" },
+  video_en: { label: "Команда видео · English",    icon: "🎬", lang: "en" },
+};
+
+// Roles that belong to a text team / video team. Globals (topic_*,
+// image_prompt_writer, qa_visual, video_keyframe_artist, video_assembler)
+// are intentionally NOT in any team — they run regardless of which teams
+// are enabled.
+const TEXT_ROLES_LIST = ["researcher", "research_validator", "article_writer",
+                         "headline_writer", "qa_editorial"];
+const VIDEO_ROLES_LIST = ["video_scenarist", "voice_director", "subtitle_styler"];
+
+function teamIdForAgent(a) {
+  if (a.role === "channel_rewriter") return "rewriter";
+  if (!a.language || a.language === "bi") return "global";
+  if (TEXT_ROLES_LIST.includes(a.role))  return `text_${a.language}`;
+  if (VIDEO_ROLES_LIST.includes(a.role)) return `video_${a.language}`;
+  return "global";
+}
+
 const ROLE_RU = {
   topic_generator: "Генератор тем",
   topic_validator: "Проверяльщик тем",
@@ -59,6 +86,10 @@ const ROLE_RU = {
   qa_visual: "Визуальный QA",
   channel_rewriter: "Адаптер для канала",
   video_scenarist: "Сценарист видео",
+  video_keyframe_artist: "Художник ключевых кадров",
+  voice_director: "Режиссёр озвучки",
+  subtitle_styler: "Стилизатор субтитров",
+  video_assembler: "Сборщик видео",
 };
 
 const ROLE_DESC = {
@@ -74,6 +105,10 @@ const ROLE_DESC = {
   qa_visual: "Выбирает лучшую картинку из сгенерированных вариантов.",
   channel_rewriter: "Адаптирует статью под формат и голос конкретного канала.",
   video_scenarist: "Раскладывает статью на сценарий короткого видео.",
+  video_keyframe_artist: "Для каждой сцены пишет промт картинки и описание движения камеры.",
+  voice_director: "Нормализует закадровый текст под TTS: темп, SSML-паузы, длина.",
+  subtitle_styler: "Превращает SRT (от Whisper) в стилизованные ASS-субтитры.",
+  video_assembler: "Технический оркестратор: склеивает клипы, аудио и субтитры в финальный MP4.",
 };
 
 const STATUS_RU = {
@@ -322,7 +357,7 @@ async function loadProject(pkey, initialTab) {
     view.innerHTML = "";
     [...tabbar.children].forEach((node, i) => node.classList.toggle("active", tabs[i] === active));
     if (active === "Pipeline") view.append(renderPipelineTab(data));
-    if (active === "Agents") view.append(renderAgentsTab(slug, data.agents));
+    if (active === "Agents") view.append(renderAgentsTab(slug, data.agents, data.project));
     if (active === "Topics") view.append(renderTopicsTab(slug, data.topics));
     if (active === "Articles") view.append(renderArticlesTab(slug, data.articles));
     if (active === "Channels") view.append(renderChannelsTab(slug, data.channels));
@@ -401,31 +436,86 @@ function renderPipelineTab(data) {
 
 // ---------- вкладка: агенты -------------------------------------------------
 
-function renderAgentsTab(projectSlug, agents) {
+function renderAgentsTab(projectSlug, agents, project) {
   if (!agents.length)
     return emptyState("🤖", "Агентов нет", "Запустите seed для создания команды.");
-  const groups = { bi: [], ru: [], en: [] };
-  for (const a of agents) {
-    if (a.role === "channel_rewriter") continue;
-    (groups[a.language] || groups.bi).push(a);
-  }
-  const rewriters = agents.filter(a => a.role === "channel_rewriter");
-
-  const card = (title, subtitle, list) => {
-    if (!list.length) return null;
-    const grid = el("div", { class: "grid grid-2" });
-    for (const a of list) grid.append(agentCard(projectSlug, a));
-    return el("div", { class: "card-section" },
-      el("div", { style: "display:flex;align-items:baseline;gap:10px;margin-bottom:14px" },
-        el("h2", { style: "margin:0" }, title),
-        el("span", { class: "muted", style: "font-size:13px" }, subtitle)),
-      grid);
+  // Group agents by team id (text_ru / text_en / video_ru / video_en /
+  // global / rewriter). The grouping shape is dictated by teamIdForAgent
+  // — every agent ends up in exactly one bucket. Empty buckets render
+  // nothing so a Russian-only project does not show empty English cards.
+  const groups = {
+    global:   [],
+    text_ru:  [], text_en:  [],
+    video_ru: [], video_en: [],
+    rewriter: [],
   };
+  for (const a of agents) {
+    const tid = teamIdForAgent(a);
+    (groups[tid] || groups.global).push(a);
+  }
+  const enabled = new Set(project?.enabled_teams || []);
+
+  // Card for one of the four toggleable teams. Returns null when the
+  // team has no agents (e.g. text_en in a Russian-only project) so the
+  // outer container doesn't render an empty section.
+  function teamCard(teamId, list) {
+    if (!list.length) return null;
+    const meta = TEAM_RU[teamId];
+    if (!meta) return null;
+    const isOn = enabled.has(teamId);
+    const grid = el("div", { class: "grid grid-2" });
+    list.forEach(a => grid.append(agentCard(projectSlug, a)));
+    return el("div", {
+        class: "card-section",
+        // Disabled team cards are still clickable — the user may want to
+        // tune a prompt before re-enabling. We just dim the section so
+        // it's clear at a glance which teams are off.
+        style: isOn ? "" : "opacity:0.55",
+      },
+      el("div", { style: "display:flex;align-items:baseline;gap:10px;margin-bottom:14px" },
+        el("h2", { style: "margin:0" }, `${meta.icon} ${meta.label}`),
+        isOn ? el("span", { class: "pill green" }, "включена")
+             : el("span", { class: "pill gray" }, "выключена"),
+        el("a", {
+          href: `#/projects/${projectSlug}/tab/settings`,
+          class: "muted sm",
+          style: "margin-left:auto;font-size:13px;text-decoration:none",
+        }, "управлять →"),
+      ),
+      grid);
+  }
+
   return el("div", {},
-    card("Общие агенты", "одни на весь проект", groups.bi),
-    card("Русская команда редакторов", "пишет на русском", groups.ru),
-    card("Английская команда редакторов", "пишет на английском", groups.en),
-    card("Адаптеры под каналы", "по одному на каждый текстовый канал", rewriters));
+    // Globals — one block, never has a toggle.
+    groups.global.length > 0 ? el("div", { class: "card-section" },
+      el("div", { style: "display:flex;align-items:baseline;gap:10px;margin-bottom:14px" },
+        el("h2", { style: "margin:0" }, "🌍 Общие агенты"),
+        el("span", { class: "muted", style: "font-size:13px" },
+          "одни на весь проект, не зависят от настройки команд")),
+      (() => {
+        const grid = el("div", { class: "grid grid-2" });
+        groups.global.forEach(a => grid.append(agentCard(projectSlug, a)));
+        return grid;
+      })(),
+    ) : null,
+    // Per-team sections (toggleable from Settings).
+    teamCard("text_ru",  groups.text_ru),
+    teamCard("text_en",  groups.text_en),
+    teamCard("video_ru", groups.video_ru),
+    teamCard("video_en", groups.video_en),
+    // Rewriters — one per text channel; not a team in the toggle sense.
+    groups.rewriter.length > 0 ? el("div", { class: "card-section" },
+      el("div", { style: "display:flex;align-items:baseline;gap:10px;margin-bottom:14px" },
+        el("h2", { style: "margin:0" }, "📡 Адаптеры под каналы"),
+        el("span", { class: "muted", style: "font-size:13px" },
+          "по одному агенту на каждый текстовый канал — переписывает статью под формат и голос канала")),
+      (() => {
+        const grid = el("div", { class: "grid grid-2" });
+        groups.rewriter.forEach(a => grid.append(agentCard(projectSlug, a)));
+        return grid;
+      })(),
+    ) : null,
+  );
 }
 
 function agentCard(projectSlug, a) {
@@ -664,7 +754,64 @@ function renderSettingsTab(slug, p) {
       toast("Настройки проекта сохранены", "success");
     } catch (e) { toast("Ошибка: " + e.message, "error"); }
   }
-  return card;
+
+  // Teams toggle card. Built from project.language_modes so a Russian-only
+  // project shows only RU toggles. enabled_teams comes from the API
+  // (parsed JSON list); we render a checkbox per (kind, lang) pair.
+  let langs;
+  try {
+    langs = JSON.parse(p.language_modes || '["ru"]');
+    if (!Array.isArray(langs) || !langs.length) langs = ["ru"];
+  } catch {
+    langs = ["ru"];
+  }
+  const enabledSet = new Set(p.enabled_teams || []);
+
+  function teamToggle(teamId, label, isOn) {
+    const cb = el("input", { type: "checkbox",
+      style: "width:auto;margin-right:8px;vertical-align:middle",
+      "data-team": teamId });
+    cb.checked = isOn;
+    return el("label", { class: "field",
+      style: "flex-direction:row;align-items:center;cursor:pointer" },
+      cb, el("span", { style: "font-size:14px;font-weight:500" }, label));
+  }
+
+  const teamsCard = el("div", { class: "card" },
+    el("h2", {}, "🎛 Команды"),
+    el("div", { class: "muted", style: "font-size:13px;margin-bottom:14px;line-height:1.6" },
+      "Каждая команда — это набор ИИ-агентов одного языка и типа " +
+      "контента. Если вам не нужен англоязычный контент — выключите " +
+      "английскую команду; если не делаете видео — выключите все " +
+      "видео-команды. Темы (общие агенты) собираются всегда, " +
+      "независимо от настройки команд."),
+    ...langs.flatMap(lang => [
+      teamToggle(`text_${lang}`,
+        `📝 Команда статей · ${lang.toUpperCase()}`,
+        enabledSet.has(`text_${lang}`)),
+      teamToggle(`video_${lang}`,
+        `🎬 Команда видео · ${lang.toUpperCase()}`,
+        enabledSet.has(`video_${lang}`)),
+    ]),
+    el("div", { class: "spacer" }),
+    el("button", { on: { click: saveTeams } },
+      "💾 Сохранить выбор команд"),
+  );
+
+  async function saveTeams() {
+    const checked = [...teamsCard.querySelectorAll('[data-team]')]
+      .filter(cb => cb.checked)
+      .map(cb => cb.dataset.team);
+    try {
+      await api(`/api/projects/${slug}`, {
+        method: "PATCH", body: { enabled_teams: checked },
+      });
+      toast("Команды сохранены", "success");
+      setTimeout(() => location.reload(), 600);
+    } catch (e) { toast("Ошибка: " + e.message, "error"); }
+  }
+
+  return el("div", {}, card, el("div", { class: "spacer" }), teamsCard);
 }
 
 

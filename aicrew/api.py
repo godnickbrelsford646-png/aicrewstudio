@@ -19,6 +19,7 @@ from typing import Any, Callable
 from . import db
 from .agents.registry import (
     default_agents_for_project,
+    default_enabled_teams,
     role_spec,
 )
 from .agents.param_schema import schema_payload
@@ -121,6 +122,23 @@ def _get_project(h: "AicrewHandler", p: dict[str, str]) -> None:
     if project is None:
         return
     pid = project["id"]
+    # Parse enabled_teams JSON column for the wire. Older projects may
+    # have it NULL/empty (the DB-level backfill in init_schema covers
+    # most cases, but defensive parsing avoids 500s on partially-migrated
+    # rows). Fall back to the language_modes-based default so the UI
+    # always sees a non-empty list.
+    try:
+        project["enabled_teams"] = json.loads(project.get("enabled_teams") or "[]")
+        if not isinstance(project["enabled_teams"], list):
+            project["enabled_teams"] = []
+    except (json.JSONDecodeError, TypeError):
+        project["enabled_teams"] = []
+    if not project["enabled_teams"]:
+        try:
+            langs = json.loads(project.get("language_modes") or '["ru"]')
+        except (json.JSONDecodeError, TypeError):
+            langs = ["ru"]
+        project["enabled_teams"] = default_enabled_teams(langs)
     with db.connect(h.settings.db_path) as conn:
         agents = db.rows_to_list(conn.execute(
             "SELECT * FROM agents WHERE project_id=? ORDER BY role, language", (pid,)
@@ -178,7 +196,7 @@ def _patch_project(h: "AicrewHandler", p: dict[str, str]) -> None:
     body = h.read_json() or {}
     allowed = {"name", "niche", "description", "is_enabled", "timezone",
                "language_modes", "daily_topics_target", "daily_articles_target",
-               "budget_usd_month", "style_guide"}
+               "budget_usd_month", "style_guide", "enabled_teams"}
     sets = []
     args: list[Any] = []
     for k, v in body.items():
@@ -186,6 +204,11 @@ def _patch_project(h: "AicrewHandler", p: dict[str, str]) -> None:
             continue
         sets.append(f"{k}=?")
         if k == "language_modes" and isinstance(v, list):
+            args.append(json.dumps(v))
+        elif k == "enabled_teams" and isinstance(v, list):
+            # Same JSON-in-string convention as language_modes. The UI
+            # sends a list of team ids (e.g. ["text_ru","video_ru"]);
+            # we serialise to JSON so SQLite stores a TEXT column.
             args.append(json.dumps(v))
         else:
             args.append(v)
@@ -954,6 +977,38 @@ class AicrewHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _ensure_enabled_teams(settings: Settings) -> None:
+    """Backfill ``projects.enabled_teams`` for older projects.
+
+    The DB-level migration in ``db.init_schema`` already runs an
+    ``UPDATE … WHERE enabled_teams IS NULL OR enabled_teams = ''`` once
+    per server start, so this function is largely defensive — it covers
+    the corner case where a project was created via raw SQL or an older
+    seed that didn't write the column. Walks every project, parses
+    ``language_modes``, computes the default team set, and writes it
+    only when the row is still empty. Idempotent.
+    """
+    with db.connect(settings.db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, language_modes FROM projects "
+            "WHERE enabled_teams IS NULL OR enabled_teams = ''"
+        ).fetchall()
+        for row in rows:
+            try:
+                langs = json.loads(row["language_modes"] or '["ru"]')
+                if not isinstance(langs, list) or not langs:
+                    langs = ["ru"]
+            except json.JSONDecodeError:
+                langs = ["ru"]
+            teams = default_enabled_teams(langs)
+            conn.execute(
+                "UPDATE projects SET enabled_teams=? WHERE id=?",
+                (json.dumps(teams), row["id"]),
+            )
+            log.info("enabled_teams: backfilled for project %s = %s",
+                     row["id"], teams)
+
+
 def _ensure_default_agents_for_existing_projects(settings: Settings) -> None:
     """Add missing default agents to existing projects after a code upgrade.
 
@@ -1028,6 +1083,9 @@ def serve(settings: Settings | None = None) -> None:
     # an old DB created before the scheduler existed would crash the very
     # first tick. Cheap to call when the schema is already current.
     db.init_schema(settings.db_path)
+    # Soft-migrate enabled_teams for projects created before the column
+    # existed. Cheap (one query per stale row) and idempotent.
+    _ensure_enabled_teams(settings)
     # Soft-migrate agents: existing projects need to pick up new roles
     # introduced by `git pull` (e.g. the video team — video_keyframe_artist,
     # voice_director, subtitle_styler, video_assembler) without forcing

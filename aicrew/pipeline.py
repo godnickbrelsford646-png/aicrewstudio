@@ -18,7 +18,7 @@ from typing import Any
 
 from . import db
 from .agents.executor import AgentExecutor
-from .agents.registry import LANG_SCOPED_ROLES
+from .agents.registry import LANG_SCOPED_ROLES, default_enabled_teams
 from .channels.registry import CHANNEL_KINDS
 from .crypto import decrypt
 from .llm.adapter import get_adapter
@@ -48,6 +48,33 @@ class PipelineSummary:
 
 def _topic_fingerprint(title: str) -> str:
     return hashlib.sha1(title.lower().strip().encode("utf-8")).hexdigest()
+
+
+def _enabled_teams_of(project: dict[str, Any]) -> set[str]:
+    """Parse ``project.enabled_teams`` JSON column into a set.
+
+    Falls back to "all teams enabled" when the column is missing or empty,
+    so legacy projects upgraded in place keep working until the API
+    backfills them via ``_ensure_enabled_teams``. The legacy fallback uses
+    the project's ``language_modes`` so a Russian-only project gets only
+    text_ru/video_ru, not the full default.
+    """
+    raw = project.get("enabled_teams")
+    if not raw:
+        try:
+            langs = json.loads(project.get("language_modes") or '["ru"]')
+        except (json.JSONDecodeError, TypeError):
+            langs = ["ru"]
+        return set(default_enabled_teams(langs))
+    if isinstance(raw, list):
+        return set(raw)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return set(parsed)
+        return set()
+    except (json.JSONDecodeError, TypeError):
+        return set()
 
 
 def _agents_by_role(conn, project_id: str) -> dict[tuple[str, str], dict[str, Any]]:
@@ -108,6 +135,8 @@ class PipelineRunner:
         confirmed: list[dict[str, Any]] = []
 
         log.info("topic phase: project=%s target=%d max_retries=%d", project_id, target, max_retries)
+        prev_count = 0
+        no_progress_streak = 0
         for attempt in range(max_retries):
             gen_out = self.executor.run(
                 agent=gen, pipeline_run_id=prid,
@@ -118,13 +147,44 @@ class PipelineRunner:
                 agent=val_runtime, pipeline_run_id=prid,
                 inputs={"candidate_topics": cands},
             ).output
+            # Dedup by fingerprint (sha1 of normalized title): skip
+            # candidates whose normalized title we already accepted in
+            # an earlier attempt of this same loop. This is exact-match
+            # dedup, not fuzzy — see the topic_validator prompt for the
+            # semantic dedup rule the LLM is asked to apply (within one
+            # batch).
+            seen_fps = {_topic_fingerprint(c["title"]) for c in confirmed}
             for v in val_out.get("validated", []):
-                if v.get("is_valid") and v["title"] not in [c["title"] for c in confirmed]:
-                    confirmed.append(v)
+                if not v.get("is_valid"):
+                    continue
+                fp = _topic_fingerprint(v["title"])
+                if fp in seen_fps:
+                    continue
+                seen_fps.add(fp)
+                confirmed.append(v)
             log.info("topic phase: attempt %d/%d -> confirmed=%d / target=%d",
                      attempt + 1, max_retries, len(confirmed), target)
+            # Hit the target exactly — done.
             if len(confirmed) >= target:
+                log.info("topic phase: target reached at attempt %d "
+                         "(confirmed=%d)", attempt + 1, len(confirmed))
                 break
+            # Soft early-exit. If this round added NOTHING new and we
+            # already have at least 60% of the target, the generator is
+            # almost certainly looping on duplicates / forbidden titles
+            # — keep what we have rather than waste another LLM round.
+            if len(confirmed) == prev_count:
+                no_progress_streak += 1
+                if (no_progress_streak >= 1
+                        and len(confirmed) >= max(1, int(target * 0.6))):
+                    log.info("topic phase: no progress at attempt %d "
+                             "(confirmed=%d/%d), stopping early to "
+                             "avoid duplicates",
+                             attempt + 1, len(confirmed), target)
+                    break
+            else:
+                no_progress_streak = 0
+            prev_count = len(confirmed)
 
         if len(confirmed) < target:
             log.warning("topic phase: stopped with %d confirmed of %d target after %d attempts",
@@ -218,7 +278,24 @@ class PipelineRunner:
             ).fetchall()
             top_topics = db.rows_to_list(top_topics)
 
+        # Filter languages by enabled text teams. If the user disabled
+        # text_ru in Settings, articles in Russian are not produced even
+        # though the project still lists "ru" in language_modes — the
+        # rationale is that language_modes is a static project capability
+        # while enabled_teams is a runtime toggle the user can flip on/off
+        # without re-creating agents.
+        enabled = _enabled_teams_of(project)
+        languages = [l for l in languages if f"text_{l}" in enabled]
         prid = pipeline_run_id or self._start_pipeline_run(project_id, "articles")
+        if not languages:
+            log.info("article phase: all text teams disabled, nothing to do")
+            with db.connect(self.settings.db_path) as conn:
+                conn.execute(
+                    "UPDATE pipeline_runs SET status=?, finished_at=? WHERE id=?",
+                    ("completed", db.now_iso(), prid),
+                )
+            return []
+
         article_ids: list[str] = []
         for topic in top_topics:
             # Step 1: write article TEXT for each language (no images yet).
@@ -527,6 +604,7 @@ class PipelineRunner:
                 "SELECT timezone FROM projects WHERE id=?", (project_id,)
             ).fetchone()
             tz_name = (project_row["timezone"] if project_row else "UTC") or "UTC"
+            project_full = _project(conn, project_id)
             channels = db.rows_to_list(conn.execute(
                 "SELECT * FROM channels WHERE project_id=? AND is_enabled=1",
                 (project_id,),
@@ -536,6 +614,19 @@ class PipelineRunner:
                 "ORDER BY written_at DESC", (project_id,)
             ).fetchall())
             agents = _agents_by_role(conn, project_id)
+        # Filter channels: only those whose language has the matching text
+        # team enabled. If text_en is off, English channels are silently
+        # skipped — the user can still see them in the UI, but new
+        # articles won't be queued for them on this run.
+        enabled = _enabled_teams_of(project_full)
+        before_filter = len(channels)
+        channels = [c for c in channels
+                    if f"text_{c['language']}" in enabled]
+        if len(channels) != before_filter:
+            log.info("publication phase: filtered %d channels by "
+                     "enabled_teams (kept %d of %d)",
+                     before_filter - len(channels), len(channels),
+                     before_filter)
         prid = self._start_pipeline_run(project_id, "publication")
         posts_created = 0
         for ch in channels:
@@ -737,6 +828,17 @@ class PipelineRunner:
             topic = db.row_to_dict(topic_row) if topic_row else {}
             agents = _agents_by_role(conn, article["project_id"])
         lang = (article.get("language") or "ru").lower()
+        # If the user disabled the corresponding video_<lang> team in
+        # Settings, refuse to run. The article page in the UI hides the
+        # "generate video" button in that case, so this is a defensive
+        # check for direct API callers.
+        enabled_teams = _enabled_teams_of(project)
+        team_id = f"video_{lang}"
+        if team_id not in enabled_teams:
+            raise RuntimeError(
+                f"video team for language={lang} is disabled in project "
+                f"settings (enabled_teams={sorted(enabled_teams)})"
+            )
         prid = self._start_pipeline_run(article["project_id"], "video")
 
         article_inputs = {

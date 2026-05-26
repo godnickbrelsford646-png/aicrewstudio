@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS projects (
     daily_articles_target    INTEGER NOT NULL DEFAULT 2,
     budget_usd_month         REAL NOT NULL DEFAULT 50.0,
     style_guide              TEXT NOT NULL DEFAULT '',
+    enabled_teams            TEXT NOT NULL DEFAULT '["text_ru","text_en","video_ru","video_en"]',
     created_at               TEXT NOT NULL,
     updated_at               TEXT NOT NULL
 );
@@ -288,6 +289,24 @@ def init_schema(db_path: str) -> None:
             )
         if "last_attempt_at" not in cols:
             conn.execute("ALTER TABLE posts ADD COLUMN last_attempt_at TEXT")
+        # Soft migration: projects.enabled_teams. Each project owns a JSON
+        # array of enabled team ids (text_ru / text_en / video_ru / video_en).
+        # The pipeline skips disabled teams; the UI hides their cards. Older
+        # DBs created before this column existed get it backfilled with the
+        # full default set so no team is silently disabled by an upgrade.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(projects)").fetchall()]
+        if "enabled_teams" not in cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN enabled_teams TEXT")
+        # Backfill NULL/empty rows. Done unconditionally — cheap on small DBs
+        # and safe (only touches rows where the value isn't set yet). The
+        # default set is intentionally maximal: even projects with
+        # language_modes=["ru"] get all four ids, which the API/UI then
+        # filters by language_modes when rendering.
+        conn.execute(
+            "UPDATE projects SET enabled_teams = ? "
+            "WHERE enabled_teams IS NULL OR enabled_teams = ''",
+            (json.dumps(["text_ru", "text_en", "video_ru", "video_en"]),),
+        )
 
 
 # --------------------------------------------------------------------- slug --
