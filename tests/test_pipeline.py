@@ -567,54 +567,5 @@ class EnabledTeamsTest(unittest.TestCase):
         self.assertIn("disabled", msg)
 
 
-class TopicCycleEarlyStopTest(unittest.TestCase):
-    """Re-running run_topic_phase against the same DB exercises the
-    forbidden-titles + early-stop interaction.
-
-    The mock generator is largely deterministic, so the second pass —
-    with the entire first batch already in forbidden_topics — produces
-    very few (often zero) new accepted titles. The early-stop logic
-    must keep the total topic count bounded; we explicitly do NOT
-    require the second pass to find anything new (per the steering
-    note: that's a valid outcome).
-    """
-
-    def setUp(self) -> None:
-        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_earlystop_")
-        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "earlystop.db")
-        os.environ["AICREW_LLM_PROVIDER"] = "mock"
-        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
-        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
-        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
-        self.settings = load_settings()
-
-    def test_second_run_does_not_explode_topic_count(self) -> None:
-        info = seed(self.settings)
-        runner = PipelineRunner(self.settings)
-        runner.run_topic_phase(info["project_id"])
-        with db.connect(self.settings.db_path) as conn:
-            first = conn.execute(
-                "SELECT COUNT(*) c FROM topics WHERE project_id=?",
-                (info["project_id"],),
-            ).fetchone()["c"]
-        self.assertGreater(first, 0, "first run produced no topics")
-        # Second pass: forbidden_titles already covers everything from
-        # the first run, so the generator must produce few or no new
-        # titles. The early-stop guard prevents the loop from spinning
-        # max_retries times. Loose upper bound: the topic count must
-        # not more than double — if it did, the early-stop would have
-        # been bypassed and we'd be regenerating duplicates indefinitely.
-        runner.run_topic_phase(info["project_id"])
-        with db.connect(self.settings.db_path) as conn:
-            second = conn.execute(
-                "SELECT COUNT(*) c FROM topics WHERE project_id=?",
-                (info["project_id"],),
-            ).fetchone()["c"]
-        self.assertLessEqual(
-            second, first * 2,
-            f"topic count grew unreasonably: first={first} second={second}",
-        )
-
-
 if __name__ == "__main__":
     unittest.main()

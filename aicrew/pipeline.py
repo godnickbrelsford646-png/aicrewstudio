@@ -135,60 +135,34 @@ class PipelineRunner:
         confirmed: list[dict[str, Any]] = []
 
         log.info("topic phase: project=%s target=%d max_retries=%d", project_id, target, max_retries)
-        prev_count = 0
-        no_progress_streak = 0
         for attempt in range(max_retries):
+            # Each retry feeds the already-confirmed titles back into
+            # forbidden_topics so the generator does not re-propose them;
+            # we keep going until either the target is reached or we run
+            # out of retries. Under-shooting the target is an acceptable
+            # outcome (per product decision).
             gen_out = self.executor.run(
                 agent=gen, pipeline_run_id=prid,
-                inputs={"project": project, "forbidden_topics": forbidden + [c["title"] for c in confirmed]},
+                inputs={"project": project,
+                        "forbidden_topics": forbidden + [c["title"] for c in confirmed]},
             ).output
             cands = gen_out.get("topics", [])
             val_out = self.executor.run(
                 agent=val_runtime, pipeline_run_id=prid,
                 inputs={"candidate_topics": cands},
             ).output
-            # Dedup by fingerprint (sha1 of normalized title): skip
-            # candidates whose normalized title we already accepted in
-            # an earlier attempt of this same loop. This is exact-match
-            # dedup, not fuzzy — see the topic_validator prompt for the
-            # semantic dedup rule the LLM is asked to apply (within one
-            # batch).
-            seen_fps = {_topic_fingerprint(c["title"]) for c in confirmed}
             for v in val_out.get("validated", []):
-                if not v.get("is_valid"):
-                    continue
-                fp = _topic_fingerprint(v["title"])
-                if fp in seen_fps:
-                    continue
-                seen_fps.add(fp)
-                confirmed.append(v)
+                if v.get("is_valid") and v["title"] not in [c["title"] for c in confirmed]:
+                    confirmed.append(v)
             log.info("topic phase: attempt %d/%d -> confirmed=%d / target=%d",
                      attempt + 1, max_retries, len(confirmed), target)
-            # Hit the target exactly — done.
             if len(confirmed) >= target:
-                log.info("topic phase: target reached at attempt %d "
-                         "(confirmed=%d)", attempt + 1, len(confirmed))
                 break
-            # Soft early-exit. If this round added NOTHING new and we
-            # already have at least 60% of the target, the generator is
-            # almost certainly looping on duplicates / forbidden titles
-            # — keep what we have rather than waste another LLM round.
-            if len(confirmed) == prev_count:
-                no_progress_streak += 1
-                if (no_progress_streak >= 1
-                        and len(confirmed) >= max(1, int(target * 0.6))):
-                    log.info("topic phase: no progress at attempt %d "
-                             "(confirmed=%d/%d), stopping early to "
-                             "avoid duplicates",
-                             attempt + 1, len(confirmed), target)
-                    break
-            else:
-                no_progress_streak = 0
-            prev_count = len(confirmed)
 
         if len(confirmed) < target:
-            log.warning("topic phase: stopped with %d confirmed of %d target after %d attempts",
-                        len(confirmed), target, max_retries)
+            log.info("topic phase: stopped with %d confirmed of %d target after %d attempts "
+                     "(under-shooting is acceptable)",
+                     len(confirmed), target, max_retries)
 
         rank_out = self.executor.run(
             agent=ranker, pipeline_run_id=prid,
