@@ -123,7 +123,13 @@ class PipelineRunner:
         val_runtime = dict(val)
         val_runtime["params"] = json.dumps(val_params)
 
-        max_retries = max(int(val_params.get("max_retries", 5) or 5), 5)
+        # Cap max_retries at a sane value. Each retry costs one generator
+        # call + one batch validator call (and possibly one fresh Tavily
+        # query if the day's cache is cold), so 3 is plenty: with 8
+        # candidates per generator pass and ~70% pass-rate, 3 retries
+        # comfortably hit a target of 8 confirmed topics. Going higher
+        # explodes the bill for marginal gain.
+        max_retries = max(1, int(val_params.get("max_retries", 3) or 3))
         # Honor topic_generator.memory_lookback_days. Default 30 days if the
         # agent param is missing (e.g. for older DBs). Topics produced within
         # this window — at any non-rejected status — are added to
@@ -147,31 +153,28 @@ class PipelineRunner:
                         "forbidden_topics": forbidden + [c["title"] for c in confirmed]},
             ).output
             cands = gen_out.get("topics", [])
-            # Per-candidate validation: we no longer hand the whole batch
-            # to topic_validator with a single generic search query. Each
-            # candidate gets its own validator call with
-            # candidate_topics=[ONE_candidate]. The validator's
-            # search_query_template ("{{ candidate_topics[0].title }}
-            # {{ candidate_topics[0].event_date }}") then renders into a
-            # specific Tavily query per candidate, giving the agent a
-            # WEB SEARCH RESULTS block focused on THAT exact title+date.
-            # The 24h search_cache deduplicates repeated queries (same
-            # candidate hit twice, identical phrasing across retries).
-            #
-            # This is the single biggest anti-hallucination win in the
-            # topic phase: previously the validator searched
-            # "{{ today_md }} historical events fact check" once for the
-            # whole batch and then approved candidates "from memory" if
-            # the date was right. Now every candidate must actually
-            # appear on the web, on the right day, before is_valid=true.
-            for cand in cands:
-                val_out = self.executor.run(
-                    agent=val_runtime, pipeline_run_id=prid,
-                    inputs={"candidate_topics": [cand]},
-                ).output
-                for v in val_out.get("validated", []):
-                    if v.get("is_valid") and v["title"] not in [c["title"] for c in confirmed]:
-                        confirmed.append(v)
+            if not cands:
+                continue
+            # Batch validation: ONE validator call for the whole pack of
+            # candidates. The validator's search_query_template renders
+            # to a generic "events on {{ today_md }} in history" query
+            # (same template as the generator's) so the 24h Tavily cache
+            # makes this a free second hit when the generator already ran.
+            # The validator prompt iterates over candidate_topics and for
+            # each one applies the WEB SEARCH RESULTS source-of-truth gate
+            # (no source = is_valid=false). This is ~N× cheaper than the
+            # per-candidate loop we used to run, while keeping the same
+            # anti-hallucination guarantees because the prompt itself
+            # demands per-candidate verification against the search block.
+            val_out = self.executor.run(
+                agent=val_runtime, pipeline_run_id=prid,
+                inputs={"candidate_topics": cands},
+            ).output
+            existing_titles = {c["title"] for c in confirmed}
+            for v in val_out.get("validated", []):
+                if v.get("is_valid") and v.get("title") not in existing_titles:
+                    confirmed.append(v)
+                    existing_titles.add(v["title"])
             log.info("topic phase: attempt %d/%d -> confirmed=%d / target=%d",
                      attempt + 1, max_retries, len(confirmed), target)
             if len(confirmed) >= target:

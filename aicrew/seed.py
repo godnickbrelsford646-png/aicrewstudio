@@ -2258,17 +2258,22 @@ ZADNIM_AGENT_PARAMS: dict[str, dict[str, Any]] = {
     },
     "topic_validator": {
         "confirmed_topics_target": 5,
+        # 3 attempts is enough with a batch validator (1 generator + 1
+        # validator per attempt = max 6 LLM calls per topic phase, vs the
+        # previous per-candidate cycle that exploded to 30-40 calls).
         "max_retries": 3,
-        # Per-candidate Tavily search: pipeline.run_topic_phase invokes the
-        # validator one candidate at a time and substitutes
-        # candidate_topics[0] into this template. Each call asks Tavily
-        # specifically about THAT candidate's title+event_date so the
-        # WEB SEARCH RESULTS block gives the agent material to confirm
-        # the date+event reality. The 24h cache in search_cache groups
-        # repeated queries automatically.
-        "search_query_template": "{{ candidate_topics[0].title }} {{ candidate_topics[0].event_date }}",
-        "search_depth": "basic",
-        "search_max_results": 5,
+        # Batch Tavily search: pipeline.run_topic_phase now hands the
+        # entire candidate pack to the validator in ONE call. The query
+        # template here is intentionally identical to topic_generator's
+        # so both agents hit the same 24h search_cache row — the
+        # validator's Tavily call is effectively free when the generator
+        # already ran in the same day. The validator prompt then
+        # iterates over candidate_topics and applies the WEB SEARCH
+        # RESULTS source-of-truth gate (no source = is_valid=false) to
+        # each candidate without needing a per-candidate Tavily query.
+        "search_query_template": "events that happened on {{ today_md }} in history different years",
+        "search_depth": "advanced",
+        "search_max_results": 12,
     },
     "topic_ranker": {
         "criteria_weights": {

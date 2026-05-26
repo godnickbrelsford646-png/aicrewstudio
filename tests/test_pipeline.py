@@ -1530,19 +1530,60 @@ class AntiHallucinationTest(unittest.TestCase):
         self.assertEqual(second, third,
                          "second re-run of init_schema must not change agent count")
 
-    # --- 6) topic_validator: per-candidate query template -------------------
+    # --- 6) topic_validator: batch search query (cost-guard) --------------
 
-    def test_topic_validator_per_candidate_search(self) -> None:
+    def test_topic_validator_batch_search(self) -> None:
+        """Validator must batch-process candidates with ONE Tavily query.
+
+        The earlier per-candidate template
+        ("{{ candidate_topics[0].title }} {{ candidate_topics[0].event_date }}")
+        plus pipeline-level inner loop produced 30-40 LLM calls per topic
+        phase ($0.30+ per run). The fix: batch validation with a generic
+        per-day query that matches topic_generator's, so the 24h Tavily
+        cache makes the validator's search free.
+        """
         from aicrew.seed import ZADNIM_AGENT_PARAMS
-        tpl = ZADNIM_AGENT_PARAMS["topic_validator"]["search_query_template"]
-        # The template MUST address a specific candidate, not the whole
-        # day. Anything else and the validator goes back to checking
-        # "{{ today_md }} historical events" in bulk (the bug we are
-        # fixing).
-        self.assertIn("candidate_topics[0].title", tpl)
-        self.assertIn("candidate_topics[0].event_date", tpl)
-        # And the generic per-day template must be gone.
-        self.assertNotIn("historical events fact check", tpl)
+        v = ZADNIM_AGENT_PARAMS["topic_validator"]
+        # Must NOT address a single candidate by index — that's the
+        # per-candidate bug.
+        self.assertNotIn("candidate_topics[0]", v["search_query_template"])
+        # The query template must include {{ today_md }} so it shares
+        # the cache row with topic_generator.
+        self.assertIn("today_md", v["search_query_template"])
+        # max_retries must be capped at a sane number.
+        self.assertLessEqual(int(v.get("max_retries", 99)), 3,
+                             "max_retries must stay small to keep costs bounded")
+
+    def test_topic_phase_calls_validator_once_per_attempt(self) -> None:
+        """End-to-end: one batch validator call per generator attempt.
+
+        Sets the project up with the mock LLM, runs run_topic_phase, and
+        counts agent_runs.role='topic_validator' rows. With 8 candidates
+        per attempt, the OLD code produced 8 validator runs per attempt;
+        the new code must produce exactly 1.
+        """
+        from aicrew.seed import seed as _seed_project
+        info = _seed_project(self.settings)
+        runner = PipelineRunner(self.settings)
+        runner.run_topic_phase(info["project_id"])
+        with db.connect(self.settings.db_path) as conn:
+            gen_runs = conn.execute(
+                "SELECT COUNT(*) AS n FROM agent_runs ar "
+                "JOIN agents a ON a.id = ar.agent_id "
+                "WHERE a.project_id=? AND a.role='topic_generator'",
+                (info["project_id"],),
+            ).fetchone()["n"]
+            val_runs = conn.execute(
+                "SELECT COUNT(*) AS n FROM agent_runs ar "
+                "JOIN agents a ON a.id = ar.agent_id "
+                "WHERE a.project_id=? AND a.role='topic_validator'",
+                (info["project_id"],),
+            ).fetchone()["n"]
+        # Strict: exactly one validator call per generator call.
+        self.assertEqual(val_runs, gen_runs,
+                         f"validator should run once per generator pass; "
+                         f"got {val_runs} validator runs for {gen_runs} "
+                         f"generator runs (per-candidate regression?)")
 
     # --- 7) research_validator: search re-enabled ---------------------------
 
