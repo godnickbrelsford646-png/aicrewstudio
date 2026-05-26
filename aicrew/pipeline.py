@@ -977,9 +977,26 @@ class PipelineRunner:
             sc["audio_path"] = os.path.join(self.settings.media_dir,
                                               os.path.basename(tts.storage_url))
 
-        # ---- [8] combine audio (mock: first scene's MP3) + transcribe ----
-        combined_audio = scene_clips[0]["audio_url"] if scene_clips else ""
-        srt = transcribe_audio(combined_audio, settings=self.settings, language=lang)
+        # ---- [8] combine audio (concat all scene MP3s) + transcribe ----
+        # Whisper sees the WHOLE voiceover as one stream so the resulting
+        # SRT timestamps cover the full final video. Without concat we'd
+        # only get subtitles for the first scene, and burn-in over the
+        # concatenated MP4 would silently drop after that.
+        from .tools.video_assembler import concat_audio_files
+        scene_audio_paths = [sc.get("audio_path", "") for sc in scene_clips]
+        combined_audio_path = concat_audio_files(
+            scene_audio_paths,
+            settings=self.settings,
+            out_basename=f"{article_id}_{lang}_combined.mp3",
+        ) or (scene_clips[0]["audio_path"] if scene_clips else "")
+        # transcribe_audio expects a /media/<file> URL (it resolves to a
+        # local file under settings.media_dir), so build that from the
+        # absolute path concat_audio_files returned.
+        combined_audio_url = (
+            "/media/" + os.path.basename(combined_audio_path)
+            if combined_audio_path else ""
+        )
+        srt = transcribe_audio(combined_audio_url, settings=self.settings, language=lang)
 
         # ---- [9] subtitle_styler -> ASS file ----
         ss_agent = (agents.get(("subtitle_styler", lang))

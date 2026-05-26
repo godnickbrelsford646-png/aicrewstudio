@@ -1068,5 +1068,214 @@ class WhisperTranscribeFlowTest(unittest.TestCase):
         self.assertIn("Auto-transcribed segment 1.", res.srt_text)
 
 
+class FfmpegAssemblyTest(unittest.TestCase):
+    """Tests the real ffmpeg orchestration in
+    aicrew/tools/video_assembler.py via mocked shutil.which + subprocess.run.
+
+    The sandbox has no ffmpeg, so we fake its presence and capture the
+    command line / write a real-looking output file so the helper accepts
+    the result.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_ffmpeg_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "ffmpeg.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        self.settings = load_settings()
+        os.makedirs(self.settings.media_dir, exist_ok=True)
+        # Two fake "scene" files. The bytes are nonsense — ffmpeg would
+        # reject them, but our subprocess.run is mocked.
+        self.clip_paths = []
+        self.audio_paths = []
+        for i in range(3):
+            cp = os.path.join(self.settings.media_dir, f"vclip_{i}.mp4")
+            ap = os.path.join(self.settings.media_dir, f"tts_{i}.mp3")
+            with open(cp, "wb") as fh:
+                fh.write(b"\x00" * 200)
+            with open(ap, "wb") as fh:
+                fh.write(b"\x00" * 200)
+            self.clip_paths.append(cp)
+            self.audio_paths.append(ap)
+        self.ass_path = os.path.join(self.settings.media_dir, "subs.ass")
+        with open(self.ass_path, "w", encoding="utf-8") as fh:
+            fh.write("[Script Info]\nScriptType: v4.00+\n")
+        self.scenes = [
+            {"clip_path": self.clip_paths[i],
+             "audio_path": self.audio_paths[i],
+             "ass_path": self.ass_path,
+             "duration_s": 5.0}
+            for i in range(3)
+        ]
+
+    def _fake_run_writes_output(self, output_size: int = 4096):
+        """Build a subprocess.run mock that creates the output file the
+        helper checks afterwards (>1KB else the helper throws)."""
+        from types import SimpleNamespace
+        captured: dict = {}
+
+        def fake_run(cmd, *args, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["timeout"] = kwargs.get("timeout")
+            # ffmpeg is invoked with the output path as the LAST arg.
+            out = cmd[-1]
+            with open(out, "wb") as fh:
+                fh.write(b"\x00" * output_size)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        return fake_run, captured
+
+    def test_assemble_invokes_ffmpeg_with_correct_filter_graph(self) -> None:
+        from aicrew.tools import video_assembler
+        fake_run, captured = self._fake_run_writes_output()
+        with _mock.patch.object(video_assembler.shutil, "which",
+                                  return_value="/usr/bin/ffmpeg"), \
+             _mock.patch.object(video_assembler.subprocess, "run",
+                                 side_effect=fake_run):
+            res = video_assembler.assemble_video(
+                self.scenes,
+                settings=self.settings,
+                article_id="ar_test",
+                language="ru",
+            )
+        cmd = captured["cmd"]
+        # Sanity: it's an ffmpeg invocation with -y and the right output.
+        self.assertEqual(cmd[0], "/usr/bin/ffmpeg")
+        self.assertIn("-y", cmd)
+        self.assertEqual(cmd[-1],
+                          os.path.join(self.settings.media_dir, "ar_test_ru.mp4"))
+        # All 6 input files (3 clips + 3 audio) are passed via -i.
+        i_args = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+        for p in self.clip_paths + self.audio_paths:
+            self.assertIn(p, i_args)
+        # filter_complex is present and contains the per-scene chains
+        # (scale to 1080:1920, trim, concat=n=3, ass=...).
+        self.assertIn("-filter_complex", cmd)
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("scale=1080:1920", fc)
+        self.assertIn("crop=1080:1920", fc)
+        self.assertIn("trim=duration=5.000", fc)
+        self.assertIn("concat=n=3:v=1:a=1", fc)
+        # Subtitles burn-in references our ASS file (with ":" escaped).
+        self.assertIn("ass=", fc)
+        self.assertIn(self.ass_path.replace(":", r"\:"), fc)
+        # Encoder settings: H.264 main + AAC + faststart.
+        self.assertIn("libx264", cmd)
+        self.assertIn("aac", cmd)
+        self.assertIn("+faststart", cmd)
+        # AssembleResult has the expected shape.
+        self.assertEqual(res.storage_url, "/media/ar_test_ru.mp4")
+        self.assertEqual(res.width, 1080)
+        self.assertEqual(res.height, 1920)
+        self.assertAlmostEqual(res.duration_s, 15.0, places=2)
+
+    def test_assemble_falls_back_to_placeholder_on_ffmpeg_error(self) -> None:
+        from aicrew.tools import video_assembler
+        from types import SimpleNamespace
+
+        def fake_run(cmd, *a, **kw):
+            return SimpleNamespace(returncode=1, stdout="",
+                                    stderr="moov atom not found")
+
+        with _mock.patch.object(video_assembler.shutil, "which",
+                                  return_value="/usr/bin/ffmpeg"), \
+             _mock.patch.object(video_assembler.subprocess, "run",
+                                 side_effect=fake_run):
+            res = video_assembler.assemble_video(
+                self.scenes,
+                settings=self.settings,
+                article_id="ar_fail",
+                language="en",
+            )
+        # Output exists (placeholder fallback).
+        local_path = os.path.join(self.settings.media_dir, "ar_fail_en.mp4")
+        self.assertTrue(os.path.exists(local_path))
+        # ftyp magic identifies it as the placeholder.
+        with open(local_path, "rb") as fh:
+            head = fh.read(32)
+        self.assertIn(b"ftypisom", head)
+        # Sidecar .error.txt was written with the failure reason.
+        err_path = local_path + ".error.txt"
+        self.assertTrue(os.path.exists(err_path))
+        with open(err_path, "r", encoding="utf-8") as fh:
+            err_content = fh.read()
+        self.assertIn("ar_fail", err_content)
+        self.assertIn("moov atom not found", err_content)
+        # AssembleResult still ok-shaped.
+        self.assertEqual(res.storage_url, "/media/ar_fail_en.mp4")
+
+    def test_assemble_uses_placeholder_when_ffmpeg_missing(self) -> None:
+        from aicrew.tools import video_assembler
+
+        with _mock.patch.object(video_assembler.shutil, "which",
+                                  return_value=None), \
+             _mock.patch.object(video_assembler.subprocess, "run") as run_mock:
+            res = video_assembler.assemble_video(
+                self.scenes,
+                settings=self.settings,
+                article_id="ar_nomf",
+                language="ru",
+            )
+        # subprocess.run NOT called when ffmpeg missing.
+        run_mock.assert_not_called()
+        # Output is the placeholder (same ftyp magic).
+        local_path = os.path.join(self.settings.media_dir, "ar_nomf_ru.mp4")
+        self.assertTrue(os.path.exists(local_path))
+        with open(local_path, "rb") as fh:
+            self.assertIn(b"ftypisom", fh.read(32))
+        self.assertEqual(res.storage_url, "/media/ar_nomf_ru.mp4")
+
+    def test_concat_audio_files_uses_ffmpeg_concat_demuxer(self) -> None:
+        from aicrew.tools import video_assembler
+        fake_run, captured = self._fake_run_writes_output()
+        with _mock.patch.object(video_assembler.shutil, "which",
+                                  return_value="/usr/bin/ffmpeg"), \
+             _mock.patch.object(video_assembler.subprocess, "run",
+                                 side_effect=fake_run):
+            out = video_assembler.concat_audio_files(
+                self.audio_paths,
+                settings=self.settings,
+                out_basename="combined.mp3",
+            )
+        # Output path is under media_dir.
+        self.assertEqual(out, os.path.join(self.settings.media_dir, "combined.mp3"))
+        # ffmpeg called with -f concat -safe 0 -c copy.
+        cmd = captured["cmd"]
+        self.assertIn("-f", cmd)
+        self.assertEqual(cmd[cmd.index("-f") + 1], "concat")
+        self.assertIn("-safe", cmd)
+        self.assertEqual(cmd[cmd.index("-safe") + 1], "0")
+        self.assertIn("-c", cmd)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
+
+    def test_concat_audio_files_returns_first_when_only_one(self) -> None:
+        from aicrew.tools import video_assembler
+        with _mock.patch.object(video_assembler.subprocess, "run") as run_mock:
+            out = video_assembler.concat_audio_files(
+                [self.audio_paths[0]],
+                settings=self.settings,
+                out_basename="combined.mp3",
+            )
+        # No ffmpeg call — single input shortcut.
+        run_mock.assert_not_called()
+        self.assertEqual(out, self.audio_paths[0])
+
+    def test_concat_audio_files_returns_first_when_ffmpeg_missing(self) -> None:
+        from aicrew.tools import video_assembler
+        with _mock.patch.object(video_assembler.shutil, "which",
+                                  return_value=None), \
+             _mock.patch.object(video_assembler.subprocess, "run") as run_mock:
+            out = video_assembler.concat_audio_files(
+                self.audio_paths,
+                settings=self.settings,
+                out_basename="combined.mp3",
+            )
+        run_mock.assert_not_called()
+        # First path returned as a passable substitute.
+        self.assertEqual(out, self.audio_paths[0])
+
+
 if __name__ == "__main__":
     unittest.main()
