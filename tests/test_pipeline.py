@@ -890,5 +890,183 @@ class OpenAITTSFlowTest(unittest.TestCase):
         self.assertIn("onyx", err_content)
 
 
+class WhisperTranscribeFlowTest(unittest.TestCase):
+    """Tests the real OpenAI whisper-1 /v1/audio/transcriptions flow.
+
+    Mocks urllib.request.urlopen and verifies:
+      1. POST goes to the right endpoint;
+      2. Content-Type is multipart/form-data with a real boundary;
+      3. the body contains form fields model='whisper-1',
+         response_format='srt', language=<lang>, and a file part with
+         the verbatim audio bytes;
+      4. the response body (SRT text) is returned through TranscribeResult;
+      5. Authorization header carries the right key per provider.
+    Also covers the 302.ai proxy variant and the HTTP 4xx fallback path
+    that writes a sidecar and returns mock SRT.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_whisper_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "whisper.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        self.settings = load_settings()
+        os.makedirs(self.settings.media_dir, exist_ok=True)
+        # A small but non-trivial fake MP3 the helper will upload.
+        self.audio_bytes = (
+            b"ID3\x03\x00\x00\x00\x00\x00\x00"
+            + b"\xff\xfb" + b"\x12\x34" * 200  # ~400 distinguishable bytes
+        )
+        self.audio_name = "tts_dummy.mp3"
+        with open(os.path.join(self.settings.media_dir, self.audio_name), "wb") as fh:
+            fh.write(self.audio_bytes)
+
+    def tearDown(self) -> None:
+        for k in ("OPENAI_API_KEY", "AI302_API_KEY"):
+            os.environ.pop(k, None)
+
+    @staticmethod
+    def _good_srt_response() -> bytes:
+        return (
+            b"1\n00:00:00,000 --> 00:00:03,500\n"
+            b"Hello from Whisper.\n\n"
+            b"2\n00:00:03,500 --> 00:00:07,000\n"
+            b"Second line.\n"
+        )
+
+    def _capture_request(self, holder: list, response_body: bytes):
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+            method = req.get_method()
+            data = req.data or b""
+            headers = dict(req.headers) if hasattr(req, "headers") else {}
+            holder.append((url, method, data, headers))
+            return _http_response(response_body)
+        return fake_urlopen
+
+    def test_openai_whisper_request_and_parse(self) -> None:
+        from aicrew.tools import whisper_transcribe
+        os.environ["OPENAI_API_KEY"] = "sk-openai-test"
+        seen: list = []
+        srt_resp = self._good_srt_response()
+        with _mock.patch(
+            "urllib.request.urlopen",
+            side_effect=self._capture_request(seen, srt_resp),
+        ):
+            res = whisper_transcribe.transcribe_audio(
+                f"/media/{self.audio_name}",
+                settings=self.settings, language="ru",
+            )
+        # Exactly one HTTP call.
+        self.assertEqual(len(seen), 1)
+        url, method, body, headers = seen[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, "https://api.openai.com/v1/audio/transcriptions")
+        # Authorization picked the OpenAI key.
+        auth = headers.get("Authorization") or headers.get("authorization") or ""
+        self.assertEqual(auth, "Bearer sk-openai-test")
+        # Multipart Content-Type with a real boundary (urllib normalises
+        # header names to title-case, so check both spellings).
+        ct = headers.get("Content-type") or headers.get("Content-Type") or ""
+        self.assertTrue(ct.startswith("multipart/form-data; boundary="),
+                         f"unexpected Content-Type: {ct!r}")
+        # Body contains form fields. We don't fully parse multipart —
+        # presence checks are sufficient and decoupled from boundary specifics.
+        self.assertIn(b'name="model"', body)
+        self.assertIn(b'whisper-1', body)
+        self.assertIn(b'name="response_format"', body)
+        self.assertIn(b'srt', body)
+        self.assertIn(b'name="language"', body)
+        # ISO 639-1 only (first two chars, lowercase).
+        self.assertIn(b'\r\n\r\nru\r\n', body)
+        # File part with the original filename and the verbatim audio bytes.
+        self.assertIn(b'name="file"', body)
+        self.assertIn(b'filename="tts_dummy.mp3"', body)
+        self.assertIn(b'Content-Type: audio/mpeg', body)
+        self.assertIn(self.audio_bytes, body)
+        # Returned SRT is exactly what the provider sent.
+        self.assertEqual(res.srt_text, srt_resp.decode("utf-8"))
+        # Duration estimated from the last "-->" timestamp.
+        self.assertAlmostEqual(res.duration_s, 7.0, places=2)
+
+    def test_302ai_whisper_uses_proxy_endpoint_and_key(self) -> None:
+        from aicrew.tools import whisper_transcribe
+        os.environ["AI302_API_KEY"] = "sk-302-test"
+        seen: list = []
+        srt_resp = self._good_srt_response()
+        with _mock.patch(
+            "urllib.request.urlopen",
+            side_effect=self._capture_request(seen, srt_resp),
+        ):
+            whisper_transcribe.transcribe_audio(
+                f"/media/{self.audio_name}",
+                settings=self.settings, language="en",
+                model="302ai:whisper-1",
+            )
+        url, _, body, headers = seen[0]
+        self.assertEqual(url, "https://api.302.ai/v1/audio/transcriptions")
+        auth = headers.get("Authorization") or headers.get("authorization") or ""
+        self.assertEqual(auth, "Bearer sk-302-test")
+        # Bare model name in the body.
+        self.assertIn(b"whisper-1", body)
+        # Language switched to en.
+        self.assertIn(b'\r\n\r\nen\r\n', body)
+
+    def test_whisper_http_error_writes_sidecar_and_returns_mock_srt(self) -> None:
+        from aicrew.tools import whisper_transcribe
+        os.environ["OPENAI_API_KEY"] = "sk-openai-test"
+
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 413, "Payload Too Large",
+                {}, io.BytesIO(b'{"error":{"message":"file too large"}}'),
+            )
+
+        with _mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = whisper_transcribe.transcribe_audio(
+                f"/media/{self.audio_name}",
+                settings=self.settings, language="ru",
+            )
+        # Returned SRT is the deterministic mock fallback (4 segments, RU line).
+        self.assertIn("Сегмент 1 автотранскрипции.", res.srt_text)
+        self.assertGreaterEqual(res.duration_s, 1.0)
+        # Sidecar exists and mentions the failure.
+        files = os.listdir(self.settings.media_dir)
+        err_files = [f for f in files if f.endswith(".error.txt")]
+        self.assertEqual(
+            len(err_files), 1,
+            f"expected one whisper error sidecar; got {files}",
+        )
+        with open(os.path.join(self.settings.media_dir, err_files[0]),
+                  "r", encoding="utf-8") as fh:
+            err_content = fh.read()
+        self.assertIn("HTTP 413", err_content)
+        self.assertIn("openai:whisper-1", err_content)
+        self.assertIn(self.audio_name, err_content)
+
+    def test_whisper_missing_audio_file_returns_mock_without_call(self) -> None:
+        """If the upstream TTS step did not produce a file, we should NOT
+        attempt the API call and just return mock SRT cleanly."""
+        from aicrew.tools import whisper_transcribe
+        os.environ["OPENAI_API_KEY"] = "sk-openai-test"
+        seen_calls: list = []
+
+        def fake_urlopen(req, timeout=None):
+            seen_calls.append(req)
+            return _http_response(self._good_srt_response())
+
+        with _mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = whisper_transcribe.transcribe_audio(
+                "/media/file_that_does_not_exist.mp3",
+                settings=self.settings, language="en",
+            )
+        # No HTTP call attempted.
+        self.assertEqual(seen_calls, [])
+        # Mock SRT (English line because language='en').
+        self.assertIn("Auto-transcribed segment 1.", res.srt_text)
+
+
 if __name__ == "__main__":
     unittest.main()
