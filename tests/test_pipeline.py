@@ -567,5 +567,186 @@ class EnabledTeamsTest(unittest.TestCase):
         self.assertIn("disabled", msg)
 
 
+class WanI2VAsyncFlowTest(unittest.TestCase):
+    """Tests the real 302.ai Wan 2.2-i2v image-to-video async flow.
+
+    Mocks urllib.request.urlopen and verifies:
+      1. submit goes to /aliyun/api/v1/services/aigc/video-generation/video-synthesis
+         with input.{prompt, img_url} and parameters.{duration, size};
+      2. img_url is the absolute URL composed via $AICREW_PUBLIC_BASE_URL
+         (302.ai needs to fetch the keyframe over HTTPS, our /media/ paths
+         are relative);
+      3. polling /aliyun/api/v1/tasks/<task_id> alternates RUNNING then
+         SUCCEEDED, and we read task_status correctly;
+      4. the video URL from output.results[0].video_url is downloaded and
+         saved as an MP4 under settings.media_dir.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_i2v_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "i2v.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        os.environ["AI302_API_KEY"] = "sk-302-test"
+        os.environ["AICREW_PUBLIC_BASE_URL"] = "https://mepoststream.site"
+        self.settings = load_settings()
+
+    def tearDown(self) -> None:
+        for k in ("AI302_API_KEY", "AICREW_PUBLIC_BASE_URL"):
+            os.environ.pop(k, None)
+
+    def test_wan22_i2v_submit_poll_download(self) -> None:
+        from aicrew.tools import video_gen
+
+        # Minimal-but-valid MP4 bytes for the "downloaded" clip.
+        mp4_bytes = (
+            b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41"
+            + b"\x00" * 80
+        )
+        submit_resp = json.dumps({
+            "request_id": "rq-1",
+            "output": {"task_id": "task-i2v", "task_status": "PENDING"},
+        }).encode("utf-8")
+        running_resp = json.dumps({
+            "request_id": "rq-2",
+            "output": {"task_id": "task-i2v", "task_status": "RUNNING"},
+        }).encode("utf-8")
+        succeeded_resp = json.dumps({
+            "request_id": "rq-3",
+            "output": {
+                "task_id": "task-i2v",
+                "task_status": "SUCCEEDED",
+                "results": [
+                    {"video_url": "https://files.302.ai/wan-i2v/result-1.mp4"},
+                ],
+            },
+        }).encode("utf-8")
+
+        seen: list[tuple[str, str, bytes]] = []
+
+        def fake_urlopen(req, timeout=None):
+            if isinstance(req, str):
+                url, method, data = req, "GET", b""
+            else:
+                url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+                method = req.get_method()
+                data = req.data or b""
+            seen.append((url, method, data))
+            if "video-generation/video-synthesis" in url and method == "POST":
+                return _http_response(submit_resp)
+            if "/tasks/task-i2v" in url and method == "GET":
+                idx = sum(1 for u, _, _ in seen if "/tasks/task-i2v" in u)
+                if idx == 1:
+                    return _http_response(running_resp)
+                return _http_response(succeeded_resp)
+            if url == "https://files.302.ai/wan-i2v/result-1.mp4":
+                return _http_response(mp4_bytes)
+            raise AssertionError(f"unexpected url: {url} method={method}")
+
+        with _mock.patch.object(video_gen, "POLL_INTERVAL_SEC", 0), \
+             _mock.patch.object(video_gen, "POLL_TIMEOUT_SEC", 30), \
+             _mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = video_gen.generate_video_clip(
+                "/media/keyframe_test.png",
+                "slow zoom in on a battlefield",
+                settings=self.settings, idx=1,
+                model="302ai:wan2.2-i2v",
+                duration_s=5.0,
+            )
+
+        # Submit URL is correct.
+        submit_url, submit_method, submit_body_raw = seen[0]
+        self.assertEqual(submit_method, "POST")
+        self.assertTrue(
+            submit_url.endswith(
+                "/aliyun/api/v1/services/aigc/video-generation/video-synthesis"
+            ),
+            f"unexpected submit url: {submit_url}",
+        )
+        # Submit body uses input.img_url (NOT image_url, NOT input_image),
+        # passes the prompt through, and includes integer duration + 9:16 size.
+        submit_body = json.loads(submit_body_raw.decode("utf-8"))
+        self.assertEqual(submit_body["model"], "wan2.2-i2v")
+        self.assertEqual(
+            submit_body["input"]["prompt"],
+            "slow zoom in on a battlefield",
+        )
+        # img_url must be the absolute URL composed via AICREW_PUBLIC_BASE_URL.
+        self.assertEqual(
+            submit_body["input"]["img_url"],
+            "https://mepoststream.site/media/keyframe_test.png",
+        )
+        self.assertEqual(submit_body["parameters"]["duration"], 5)
+        self.assertEqual(submit_body["parameters"]["size"], "1080*1920")
+        # Polled at least twice (RUNNING -> SUCCEEDED).
+        poll_count = sum(1 for u, _, _ in seen if "/tasks/task-i2v" in u)
+        self.assertGreaterEqual(poll_count, 2)
+        # Downloaded the result URL.
+        urls = [u for u, _, _ in seen]
+        self.assertIn("https://files.302.ai/wan-i2v/result-1.mp4", urls)
+        # MP4 file exists on disk.
+        self.assertTrue(res.storage_url.startswith("/media/"))
+        local_path = os.path.join(
+            self.settings.media_dir, res.storage_url.rsplit("/", 1)[-1],
+        )
+        self.assertTrue(os.path.exists(local_path))
+        self.assertGreater(os.path.getsize(local_path), 0)
+
+    def test_wan_i2v_failed_task_writes_error_sidecar(self) -> None:
+        """If 302.ai reports task FAILED, we should fall back to placeholder
+        AND write a vclip_<hash>.error.txt sidecar with the failure message."""
+        from aicrew.tools import video_gen
+
+        submit_resp = json.dumps({
+            "request_id": "rq-1",
+            "output": {"task_id": "task-fail", "task_status": "PENDING"},
+        }).encode("utf-8")
+        failed_resp = json.dumps({
+            "request_id": "rq-2",
+            "output": {
+                "task_id": "task-fail",
+                "task_status": "FAILED",
+                "code": "InvalidParameter",
+                "message": "img_url not reachable",
+            },
+        }).encode("utf-8")
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+            if "video-generation/video-synthesis" in url:
+                return _http_response(submit_resp)
+            if "/tasks/task-fail" in url:
+                return _http_response(failed_resp)
+            raise AssertionError(f"unexpected url: {url}")
+
+        with _mock.patch.object(video_gen, "POLL_INTERVAL_SEC", 0), \
+             _mock.patch.object(video_gen, "POLL_TIMEOUT_SEC", 30), \
+             _mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = video_gen.generate_video_clip(
+                "/media/anything.png",
+                "any motion",
+                settings=self.settings, idx=2,
+                model="302ai:wan2.2-i2v",
+                duration_s=5.0,
+            )
+        # We get a placeholder back, not a real video.
+        self.assertTrue(res.storage_url.startswith("/media/"))
+        # Sidecar .error.txt exists with the failure reason.
+        files = os.listdir(self.settings.media_dir)
+        err_files = [f for f in files
+                     if f.startswith("vclip_") and f.endswith(".error.txt")]
+        self.assertEqual(
+            len(err_files), 1,
+            f"expected one error sidecar; got {files}",
+        )
+        with open(os.path.join(self.settings.media_dir, err_files[0]),
+                  "r", encoding="utf-8") as fh:
+            err_content = fh.read()
+        self.assertIn("img_url not reachable", err_content)
+        self.assertIn("302ai:wan2.2-i2v", err_content)
+
+
 if __name__ == "__main__":
     unittest.main()
