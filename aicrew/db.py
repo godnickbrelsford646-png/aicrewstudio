@@ -175,6 +175,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
     height        INTEGER,
     duration_s    REAL,
     chosen        INTEGER NOT NULL DEFAULT 0,
+    cost_usd      REAL NOT NULL DEFAULT 0,
     meta          TEXT NOT NULL DEFAULT '{}',
     created_at    TEXT NOT NULL
 );
@@ -307,6 +308,18 @@ def init_schema(db_path: str) -> None:
             "WHERE enabled_teams IS NULL OR enabled_teams = ''",
             (json.dumps(["text_ru", "text_en", "video_ru", "video_en"]),),
         )
+
+        # Soft migration: media_assets.cost_usd for the cost-tracking
+        # dashboard. Older rows get 0 (correct for mock/placeholder
+        # assets, and an acceptable lossy-zero for real-API media we
+        # can't backfill — see docs/03-data-model.md). Idempotent:
+        # ALTER is gated on the column not already existing.
+        cols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(media_assets)").fetchall()]
+        if "cost_usd" not in cols:
+            conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0"
+            )
 
         # Sync ZADNIM-style agents with the latest prompts / params /
         # model config. Idempotent: re-running just re-applies the same

@@ -1570,3 +1570,313 @@ class AntiHallucinationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+# ============================================================================
+# Media-cost tracking
+#
+# Cost-tracking dashboard previously summed only agent_runs.cost_usd. Image
+# / video / TTS / Whisper calls write their own assets to media_assets but
+# their per-call charge was lost. The fix routes a cost_usd value through
+# every media tool, persists it on the media_assets row, and aggregates it
+# into the /api/projects/{slug}/costs endpoint.
+#
+# Tests cover four layers:
+#   1) pure pricing helpers in aicrew/llm/pricing.py (no I/O);
+#   2) the soft-migration that adds media_assets.cost_usd, idempotent;
+#   3) tool return shape — generate_image must surface cost_usd;
+#   4) the /costs endpoint — synthetic media_assets rows must show up
+#      in today_usd / month_usd / by_role / by_phase / by_day.
+# ============================================================================
+
+
+class PricingHelpersTest(unittest.TestCase):
+    """Pure-function tests for aicrew/llm/pricing.py — no DB, no HTTP."""
+
+    def test_estimate_image_cost(self) -> None:
+        from aicrew.llm.pricing import estimate_image_cost
+        # Wan 2.7: $0.05 per image at the published 302.ai rate.
+        self.assertAlmostEqual(estimate_image_cost("302ai:wan2.7-image", 1), 0.05, places=6)
+        # Three images bill linearly.
+        self.assertAlmostEqual(estimate_image_cost("302ai:wan2.7-image", 3), 0.15, places=6)
+        # Mock and unknown models price at $0 (lossy-zero by design).
+        self.assertEqual(estimate_image_cost("mock:placeholder", 1), 0.0)
+        self.assertEqual(estimate_image_cost("nonexistent:model", 1), 0.0)
+        # Negative count clamps to 0 — a paranoid guard against bad inputs.
+        self.assertEqual(estimate_image_cost("302ai:wan2.7-image", -5), 0.0)
+
+    def test_estimate_video_cost(self) -> None:
+        from aicrew.llm.pricing import estimate_video_cost
+        # Wan 2.2-i2v: $0.12 per 5-second clip.
+        self.assertAlmostEqual(estimate_video_cost("302ai:wan2.2-i2v", 5.0), 0.12, places=6)
+        # 10-second clip = 2x the 5s rate.
+        self.assertAlmostEqual(estimate_video_cost("302ai:wan2.2-i2v", 10.0), 0.24, places=6)
+        # Mock = $0.
+        self.assertEqual(estimate_video_cost("mock:placeholder", 5.0), 0.0)
+        # Negative duration clamps to 0.
+        self.assertEqual(estimate_video_cost("302ai:wan2.2-i2v", -3.0), 0.0)
+
+    def test_estimate_tts_cost(self) -> None:
+        from aicrew.llm.pricing import estimate_tts_cost
+        # gpt-4o-mini-tts: $0.6 per 1M chars => 1000 chars = $0.0006.
+        self.assertAlmostEqual(estimate_tts_cost("openai:gpt-4o-mini-tts", 1000),
+                               0.0006, places=6)
+        # 1M chars hits the headline rate exactly.
+        self.assertAlmostEqual(estimate_tts_cost("openai:gpt-4o-mini-tts", 1_000_000),
+                               0.6, places=6)
+        # Mock = $0.
+        self.assertEqual(estimate_tts_cost("mock:placeholder", 1000), 0.0)
+
+    def test_estimate_whisper_cost(self) -> None:
+        from aicrew.llm.pricing import estimate_whisper_cost
+        # Whisper-1: $0.006 per minute => 60s = $0.006.
+        self.assertAlmostEqual(estimate_whisper_cost("openai:whisper-1", 60.0),
+                               0.006, places=6)
+        # Two minutes = 2x.
+        self.assertAlmostEqual(estimate_whisper_cost("openai:whisper-1", 120.0),
+                               0.012, places=6)
+        # 302.ai proxy: same rate.
+        self.assertAlmostEqual(estimate_whisper_cost("302ai:whisper-1", 60.0),
+                               0.006, places=6)
+        # Mock = $0.
+        self.assertEqual(estimate_whisper_cost("mock:placeholder", 60.0), 0.0)
+
+
+class MediaAssetsSchemaTest(unittest.TestCase):
+    """The soft-migration that adds media_assets.cost_usd."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_costs_")
+        self.db_path = os.path.join(self.tmpdir, "schema.db")
+
+    def test_media_assets_cost_column_exists(self) -> None:
+        db.init_schema(self.db_path)
+        with db.connect(self.db_path) as conn:
+            cols = [r["name"]
+                    for r in conn.execute(
+                        "PRAGMA table_info(media_assets)").fetchall()]
+        self.assertIn("cost_usd", cols,
+                      "media_assets.cost_usd must be added by init_schema()")
+
+    def test_media_assets_migration_idempotent(self) -> None:
+        # Running init_schema twice on the same DB must not raise.
+        db.init_schema(self.db_path)
+        db.init_schema(self.db_path)
+        # And the column is still present (we didn't accidentally drop it).
+        with db.connect(self.db_path) as conn:
+            cols = [r["name"]
+                    for r in conn.execute(
+                        "PRAGMA table_info(media_assets)").fetchall()]
+        self.assertIn("cost_usd", cols)
+
+    def test_media_assets_migration_old_db(self) -> None:
+        """Backfill on a DB created without cost_usd: ALTER adds the column."""
+        # Step 1: create a media_assets table without cost_usd, mimicking a
+        # production DB that pre-dates the cost-tracking work.
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "CREATE TABLE media_assets ("
+                "id TEXT PRIMARY KEY, "
+                "article_id TEXT, project_id TEXT NOT NULL, kind TEXT NOT NULL, "
+                "language TEXT, prompt TEXT NOT NULL DEFAULT '', "
+                "model TEXT NOT NULL DEFAULT '', storage_url TEXT NOT NULL, "
+                "mime TEXT NOT NULL DEFAULT '', width INTEGER, height INTEGER, "
+                "duration_s REAL, chosen INTEGER NOT NULL DEFAULT 0, "
+                "meta TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO media_assets (id, project_id, kind, storage_url, "
+                "created_at) VALUES (?,?,?,?,?)",
+                ("ma_old1", "p_old", "image", "/media/old.png",
+                 "2024-01-01T00:00:00Z"),
+            )
+            conn.commit()
+        # Step 2: init_schema must add the column without dropping data.
+        db.init_schema(self.db_path)
+        with db.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT id, cost_usd FROM media_assets WHERE id=?", ("ma_old1",)
+            ).fetchone()
+        self.assertIsNotNone(row)
+        # Backfilled rows default to 0 — that's the lossy-zero contract.
+        self.assertEqual(float(row["cost_usd"]), 0.0)
+
+
+class MediaToolsCostShapeTest(unittest.TestCase):
+    """Tool result objects must surface cost_usd; mock paths must be free."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_tools_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "tools.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        # Make sure no real-API keys are present so the tools take the
+        # mock path even when the test host has them set.
+        for k in ("OPENAI_API_KEY", "AI302_API_KEY"):
+            os.environ.pop(k, None)
+        self.settings = load_settings()
+
+    def test_image_gen_returns_cost_mock(self) -> None:
+        from aicrew.tools.image_gen import generate_image
+        res = generate_image("test prompt", settings=self.settings, idx=0,
+                             model="mock:placeholder")
+        self.assertTrue(hasattr(res, "cost_usd"),
+                        "ImageResult must expose cost_usd")
+        self.assertEqual(res.cost_usd, 0.0,
+                         "Mock image must cost $0")
+
+    def test_tts_gen_returns_cost_mock(self) -> None:
+        from aicrew.tools.tts_gen import generate_tts
+        res = generate_tts("hello world", settings=self.settings, idx=0,
+                           model="mock:placeholder", voice_id="onyx")
+        self.assertTrue(hasattr(res, "cost_usd"))
+        self.assertEqual(res.cost_usd, 0.0)
+
+    def test_video_gen_returns_cost_mock(self) -> None:
+        from aicrew.tools.video_gen import generate_video_clip
+        res = generate_video_clip("/media/x.png", "slow zoom",
+                                  settings=self.settings, idx=0,
+                                  model="mock:placeholder", duration_s=5.0)
+        self.assertTrue(hasattr(res, "cost_usd"))
+        self.assertEqual(res.cost_usd, 0.0)
+
+    def test_whisper_returns_cost_mock(self) -> None:
+        from aicrew.tools.whisper_transcribe import transcribe_audio
+        res = transcribe_audio("/media/missing.mp3", settings=self.settings,
+                               language="en", model="mock:placeholder")
+        self.assertTrue(hasattr(res, "cost_usd"))
+        self.assertEqual(res.cost_usd, 0.0)
+
+
+class CostsEndpointMediaTest(unittest.TestCase):
+    """End-to-end check: media_assets.cost_usd must surface in /costs.
+
+    We exercise the endpoint by directly invoking ``_project_costs`` with a
+    fake handler — far simpler than spinning up the ThreadingHTTPServer in
+    tests, and it covers exactly the SQL aggregation we care about.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_costsep_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "costs.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        self.settings = load_settings()
+        # Make sure the schema exists; the test does not need a full seed.
+        db.init_schema(self.settings.db_path)
+        # Insert a minimal user + project so _resolve_project finds us.
+        with db.connect(self.settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO users (id, email, created_at) VALUES (?,?,?)",
+                ("u_test", "t@example.com", db.now_iso()),
+            )
+            conn.execute(
+                "INSERT INTO projects (id, user_id, slug, name, niche, "
+                "description, is_enabled, timezone, language_modes, "
+                "daily_topics_target, daily_articles_target, "
+                "budget_usd_month, style_guide, enabled_teams, "
+                "created_at, updated_at) VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("p_test", "u_test", "test-project", "Test Project",
+                 "tests", "", 1, "UTC", '["ru"]', 1, 1, 50.0, "",
+                 '["text_ru","text_en","video_ru","video_en"]',
+                 db.now_iso(), db.now_iso()),
+            )
+
+    def _call_costs(self) -> dict:
+        """Invoke ``api._project_costs`` with a fake handler that captures
+        the JSON body instead of writing to a socket.
+        """
+        from aicrew import api as api_mod
+
+        captured: dict = {}
+
+        class _FakeHandler:
+            def __init__(self, settings):
+                self.settings = settings
+
+            def send_json(self, status, payload):
+                captured["status"] = status
+                captured["body"] = payload
+
+        h = _FakeHandler(self.settings)
+        api_mod._project_costs(h, {"pkey": "test-project"})
+        self.assertEqual(captured.get("status"), 200,
+                         f"costs endpoint returned non-200: {captured}")
+        return captured["body"]
+
+    def test_costs_endpoint_includes_image_media(self) -> None:
+        # Fake an image asset created today, $0.05 (Wan 2.7 single image).
+        with db.connect(self.settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO media_assets (id, project_id, kind, storage_url, "
+                "cost_usd, created_at) VALUES (?,?,?,?,?,?)",
+                ("ma_img1", "p_test", "image", "/media/x.png", 0.05,
+                 db.now_iso()),
+            )
+        body = self._call_costs()
+        # Image cost must show up in today_usd AND month_usd.
+        self.assertGreaterEqual(body["today_usd"], 0.05 - 1e-9,
+                                f"today_usd missing image cost: {body}")
+        self.assertGreaterEqual(body["month_usd"], 0.05 - 1e-9,
+                                f"month_usd missing image cost: {body}")
+        # by_role[] must contain a synthetic __media_image__ row.
+        roles = {r["role"]: r for r in body["by_role"]}
+        self.assertIn("__media_image__", roles,
+                      f"by_role missing __media_image__: {body['by_role']}")
+        self.assertAlmostEqual(roles["__media_image__"]["total_usd"], 0.05,
+                               places=6)
+        # by_phase[] must contain 'media' (image -> media phase, not video).
+        phases = {r["phase"]: r for r in body["by_phase"]}
+        self.assertIn("media", phases,
+                      f"by_phase missing 'media' synthetic row: {body['by_phase']}")
+        self.assertAlmostEqual(phases["media"]["total_usd"], 0.05, places=6)
+
+    def test_costs_endpoint_video_phase(self) -> None:
+        # Wan i2v scene clip: $0.12 -> goes to 'video' phase, NOT 'media'.
+        with db.connect(self.settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO media_assets (id, project_id, kind, storage_url, "
+                "cost_usd, created_at) VALUES (?,?,?,?,?,?)",
+                ("ma_vid1", "p_test", "video", "/media/clip.mp4", 0.12,
+                 db.now_iso()),
+            )
+        body = self._call_costs()
+        phases = {r["phase"]: r for r in body["by_phase"]}
+        self.assertIn("video", phases,
+                      f"by_phase missing 'video' synthetic row: {body['by_phase']}")
+        self.assertAlmostEqual(phases["video"]["total_usd"], 0.12, places=6)
+        # And NOT in 'media' (we route 'video' kind to its own phase).
+        self.assertNotIn("media", phases,
+                         "video kind must not leak into 'media' phase")
+        # by_role[]: __media_video__ row exists.
+        roles = {r["role"]: r for r in body["by_role"]}
+        self.assertIn("__media_video__", roles)
+
+    def test_costs_endpoint_by_day_includes_media(self) -> None:
+        # Insert an asset with an explicit timestamp = today.
+        # Format must be SQLite datetime() compatible (YYYY-MM-DD HH:MM:SS
+        # works; ISO with 'T' and 'Z' is also accepted by date()).
+        with db.connect(self.settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO media_assets (id, project_id, kind, storage_url, "
+                "cost_usd, created_at) VALUES (?,?,?,?,?,?)",
+                ("ma_audio1", "p_test", "audio", "/media/v.mp3", 0.001,
+                 db.now_iso()),
+            )
+        body = self._call_costs()
+        # 14-day window, oldest first; today's bucket is the LAST one.
+        self.assertEqual(len(body["by_day"]), 14)
+        self.assertGreaterEqual(body["by_day"][-1]["total_usd"], 0.001 - 1e-9,
+                                f"today's by_day bucket missing media cost: "
+                                f"{body['by_day'][-1]}")
+
+
+if __name__ == "__main__":
+    unittest.main()

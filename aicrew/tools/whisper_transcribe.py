@@ -37,6 +37,7 @@ log = logging.getLogger("aicrew.whisper_transcribe")
 class TranscribeResult:
     srt_text: str
     duration_s: float
+    cost_usd: float = 0.0
 
 
 def _format_ts(t: float) -> str:
@@ -112,7 +113,7 @@ def transcribe_audio(
     )
     if use_mock:
         srt = _mock_srt(language)
-        return TranscribeResult(srt_text=srt, duration_s=12.0)
+        return TranscribeResult(srt_text=srt, duration_s=12.0, cost_usd=0.0)
 
     # Resolve the audio file on disk. Whisper needs the bytes themselves;
     # we never give it a URL.
@@ -125,12 +126,23 @@ def transcribe_audio(
             audio_path,
         )
         srt = _mock_srt(language)
-        return TranscribeResult(srt_text=srt, duration_s=12.0)
+        return TranscribeResult(srt_text=srt, duration_s=12.0, cost_usd=0.0)
 
+    # Best-effort audio duration in seconds. Used both for cost
+    # estimation (Whisper bills per minute) and as a fallback for the
+    # returned duration_s when we cannot derive it from the SRT.
+    audio_duration_s = _audio_duration_seconds(audio_path)
+    cost_usd = 0.0
     try:
         srt = _call_openai_whisper(
             audio_path, real_model, base_url, api_key, language,
         )
+        # Bill against the audio length we measured locally — Whisper
+        # itself does not echo input duration, but the rate is per
+        # minute of input audio (not output text), so the local probe
+        # is the right anchor.
+        from ..llm.pricing import estimate_whisper_cost
+        cost_usd = estimate_whisper_cost(model, duration_s=audio_duration_s)
     except Exception as exc:
         log.exception("whisper call failed, falling back to mock SRT")
         log.warning(
@@ -157,9 +169,50 @@ def transcribe_audio(
         except Exception:  # pragma: no cover - diagnostic best-effort
             log.exception("failed to write whisper error sidecar file")
         srt = _mock_srt(language)
+        # Real call never reached the provider — no charge.
+        cost_usd = 0.0
 
-    duration_s = _estimate_duration_from_srt(srt) or 12.0
-    return TranscribeResult(srt_text=srt, duration_s=duration_s)
+    duration_s = _estimate_duration_from_srt(srt) or audio_duration_s or 12.0
+    return TranscribeResult(srt_text=srt, duration_s=duration_s, cost_usd=cost_usd)
+
+
+def _audio_duration_seconds(path: str) -> float:
+    """Best-effort audio duration probe.
+
+    Uses ``ffprobe`` when available (accurate for any audio format we
+    feed Whisper). Falls back to a ``filesize / 16000`` byte-rate estimate
+    that approximates a 128 kbps MP3 — coarse, but never blocks the
+    pipeline and stays inside ±20% for typical voiceovers, which is
+    accurate enough for cost-tracking purposes.
+
+    Returns 0.0 when neither probe works (e.g. the file does not exist),
+    so callers can compute a 0-cost-ish charge rather than crashing.
+    """
+    try:
+        import subprocess  # local: keep test imports lean and stdlib-only.
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0", path,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return max(0.0, float(out.stdout.strip()))
+    except (FileNotFoundError, subprocess.TimeoutExpired,
+            ValueError, OSError, subprocess.SubprocessError):
+        # ffprobe missing or unhappy — fall through to the filesize
+        # heuristic. We deliberately do NOT log here because the test
+        # path triggers this on every Whisper call.
+        pass
+    try:
+        # ~128 kbps MP3 -> 16000 bytes per second of audio. This is the
+        # de-facto bitrate gpt-4o-mini-tts emits and what 99% of our
+        # pipeline audio files are encoded at.
+        return max(0.0, os.path.getsize(path) / 16000.0)
+    except OSError:
+        return 0.0
 
 
 def _estimate_duration_from_srt(srt: str) -> float:

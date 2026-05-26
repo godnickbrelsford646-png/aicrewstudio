@@ -40,6 +40,7 @@ class TTSResult:
     duration_s: float
     model: str
     voice_id: str
+    cost_usd: float = 0.0
 
 
 def _placeholder_mp3(seed: str = "") -> bytes:
@@ -109,10 +110,20 @@ def generate_tts(
         or model in ("", "mock")
         or not api_key
     )
+    # TTS cost is billed per input character; compute it once up-front so
+    # the cache-hit branch and the real-call branch share the same value.
+    # use_mock=True when (a) model is mock:*, OR (b) the matching API
+    # key is missing — in both cases nothing is sent to a paid endpoint.
+    if use_mock:
+        cost_usd = 0.0
+    else:
+        from ..llm.pricing import estimate_tts_cost
+        cost_usd = estimate_tts_cost(model, chars=len(text or ""))
     if os.path.exists(path):
         return TTSResult(
             storage_url=f"/media/{filename}", mime="audio/mpeg",
             duration_s=duration_s, model=model, voice_id=voice_id,
+            cost_usd=cost_usd,
         )
     if use_mock:
         data = _placeholder_mp3(seed=f"{text[:80]}|{idx}|{voice_id}")
@@ -128,6 +139,9 @@ def generate_tts(
                 "for details.", exc, h,
             )
             data = _placeholder_mp3(seed=f"{text[:80]}|{idx}|{voice_id}|err")
+            # Real call failed before billing — clear cost so the
+            # dashboard does not over-report on transient TTS errors.
+            cost_usd = 0.0
             try:
                 err_path = os.path.join(settings.media_dir, f"tts_{h}.error.txt")
                 with open(err_path, "w", encoding="utf-8") as efh:
@@ -154,6 +168,7 @@ def generate_tts(
         duration_s=duration_s,
         model=model,
         voice_id=voice_id,
+        cost_usd=cost_usd,
     )
 
 

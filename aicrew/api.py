@@ -526,17 +526,32 @@ def _list_posts(h: "AicrewHandler", p: dict[str, str]) -> None:
 def _project_costs(h: "AicrewHandler", p: dict[str, str]) -> None:
     """Cost summary for the project's main dashboard.
 
-    Aggregates ``agent_runs.cost_usd`` (summed) over every run that belongs
-    to a ``pipeline_run`` of this project. Returns:
+    Aggregates two cost sources side by side:
+      * ``agent_runs.cost_usd`` — every LLM call invoked through the
+        agent executor (joined back to the project via pipeline_runs).
+      * ``media_assets.cost_usd`` — image / video / TTS / Whisper
+        spend, attributed directly to the project (the image/video
+        tools write the per-call cost into media_assets at INSERT time
+        — see aicrew/llm/pricing.py for rate cards).
 
-      - today_usd       : sum since UTC midnight today
-      - month_usd       : sum over the last 30 days
+    Returns:
+      - today_usd       : sum since UTC midnight today (LLM + media)
+      - month_usd       : sum over the last 30 days       (LLM + media)
       - budget_usd_month: from projects.budget_usd_month
-      - by_role[]       : top spenders per agent role (last 30 days)
-      - by_phase[]      : split by pipeline_runs.kind (topics / articles
-                          / publication / video / full)
-      - by_day[]        : 14-day timeseries with zero-fill, oldest first,
-                          for the bar chart on the Pipeline tab.
+      - by_role[]       : top spenders. Real agent roles plus four
+                          synthetic ``__media_{kind}__`` rows
+                          (image / video / audio / subtitle), only
+                          included when their total is > 0.
+      - by_phase[]      : pipeline_runs.kind (topics / articles /
+                          publication / video / full) plus two
+                          synthetic phases:
+                            * 'media' = image+audio+subtitle assets
+                            * 'video' = Wan i2v scene clips
+                          Synthetic rows are merged into the matching
+                          pipeline phase (so a video pipeline run +
+                          its scene clips live on one 'video' row).
+      - by_day[]        : 14-day timeseries with zero-fill, oldest
+                          first, summing both sources per day.
 
     All sums are floats in USD (we never round on the wire — UI rounds
     for display).
@@ -547,14 +562,23 @@ def _project_costs(h: "AicrewHandler", p: dict[str, str]) -> None:
         return
     pid = project["id"]
     with db.connect(h.settings.db_path) as conn:
-        today = conn.execute(
+        # ---- today_usd: agent_runs + media_assets, both today (UTC) ----
+        today_agents = conn.execute(
             "SELECT COALESCE(SUM(ar.cost_usd), 0) AS total "
             "FROM agent_runs ar "
             "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
             "WHERE pr.project_id = ? AND date(ar.started_at) = date('now')",
             (pid,),
         ).fetchone()["total"]
-        month = conn.execute(
+        today_media = conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM media_assets "
+            "WHERE project_id = ? AND date(created_at) = date('now')",
+            (pid,),
+        ).fetchone()["total"]
+        today = float(today_agents or 0) + float(today_media or 0)
+        # ---- month_usd: same shape, last 30 days ----
+        month_agents = conn.execute(
             "SELECT COALESCE(SUM(ar.cost_usd), 0) AS total "
             "FROM agent_runs ar "
             "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
@@ -562,6 +586,15 @@ def _project_costs(h: "AicrewHandler", p: dict[str, str]) -> None:
             "AND ar.started_at >= datetime('now', '-30 days')",
             (pid,),
         ).fetchone()["total"]
+        month_media = conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM media_assets "
+            "WHERE project_id = ? "
+            "AND created_at >= datetime('now', '-30 days')",
+            (pid,),
+        ).fetchone()["total"]
+        month = float(month_agents or 0) + float(month_media or 0)
+        # ---- by_role[]: agent runs by role + synthetic __media_{kind}__ ----
         by_role_rows = conn.execute(
             "SELECT COALESCE(a.role, '(unknown)') AS role, "
             "COUNT(*) AS runs, "
@@ -574,6 +607,19 @@ def _project_costs(h: "AicrewHandler", p: dict[str, str]) -> None:
             "GROUP BY a.role ORDER BY total DESC, runs DESC",
             (pid,),
         ).fetchall()
+        # Synthetic media roles: one per kind. Only emitted when total>0
+        # so the UI table doesn't get four empty rows for projects that
+        # never ran the video team.
+        media_role_rows = conn.execute(
+            "SELECT kind, COUNT(*) AS runs, "
+            "COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM media_assets "
+            "WHERE project_id = ? "
+            "AND created_at >= datetime('now', '-30 days') "
+            "GROUP BY kind",
+            (pid,),
+        ).fetchall()
+        # ---- by_phase[]: pipeline_runs.kind + synthetic 'media' / 'video' ----
         by_phase_rows = conn.execute(
             "SELECT pr.kind AS phase, COUNT(*) AS runs, "
             "COALESCE(SUM(ar.cost_usd), 0) AS total "
@@ -584,7 +630,24 @@ def _project_costs(h: "AicrewHandler", p: dict[str, str]) -> None:
             "GROUP BY pr.kind ORDER BY total DESC",
             (pid,),
         ).fetchall()
-        # 14-day timeseries (oldest-first), zero-filled for missing days.
+        # Media is not linked to a pipeline_run, so we synthesise two
+        # phases out of media_assets.kind:
+        #   * 'media' = image / audio / subtitle (article pipeline output)
+        #   * 'video' = the video team's per-scene Wan i2v clips
+        # Both are aggregated to a single row each (counts include every
+        # asset row in the window; total in USD).
+        media_phase_rows = conn.execute(
+            "SELECT "
+            "  CASE WHEN kind = 'video' THEN 'video' ELSE 'media' END AS phase, "
+            "  COUNT(*) AS runs, "
+            "  COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM media_assets "
+            "WHERE project_id = ? "
+            "AND created_at >= datetime('now', '-30 days') "
+            "GROUP BY CASE WHEN kind = 'video' THEN 'video' ELSE 'media' END",
+            (pid,),
+        ).fetchall()
+        # ---- by_day[]: 14-day timeseries with zero-fill, oldest first ----
         day_rows = conn.execute(
             "SELECT date(ar.started_at) AS d, "
             "COALESCE(SUM(ar.cost_usd), 0) AS total "
@@ -595,7 +658,65 @@ def _project_costs(h: "AicrewHandler", p: dict[str, str]) -> None:
             "GROUP BY date(ar.started_at)",
             (pid,),
         ).fetchall()
+        day_media_rows = conn.execute(
+            "SELECT date(created_at) AS d, "
+            "COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM media_assets "
+            "WHERE project_id = ? "
+            "AND created_at >= datetime('now', '-13 days') "
+            "GROUP BY date(created_at)",
+            (pid,),
+        ).fetchall()
+    # Merge by_role[]: append synthetic __media_{kind}__ rows.
+    by_role_out = [
+        {"role": r["role"], "runs": int(r["runs"]),
+         "total_usd": float(r["total"] or 0)}
+        for r in by_role_rows
+    ]
+    for r in media_role_rows:
+        total = float(r["total"] or 0)
+        if total <= 0:
+            continue
+        by_role_out.append({
+            "role": f"__media_{r['kind']}__",
+            "runs": int(r["runs"]),
+            "total_usd": total,
+        })
+    by_role_out.sort(key=lambda r: (-r["total_usd"], -r["runs"]))
+    # Merge by_phase[]: combine pipeline_runs.kind rows with synthetic
+    # 'media' / 'video' rows. If a phase already exists in by_phase_rows
+    # (e.g. 'video' phase from pipeline_runs.kind='video' with agent_runs
+    # cost on top of media), sum totals and runs into one row.
+    by_phase_map: dict[str, dict[str, Any]] = {}
+    for r in by_phase_rows:
+        phase = r["phase"] or "(unknown)"
+        by_phase_map[phase] = {
+            "phase": phase,
+            "runs": int(r["runs"]),
+            "total_usd": float(r["total"] or 0),
+        }
+    for r in media_phase_rows:
+        total = float(r["total"] or 0)
+        if total <= 0:
+            continue
+        phase = r["phase"]
+        if phase in by_phase_map:
+            by_phase_map[phase]["runs"] += int(r["runs"])
+            by_phase_map[phase]["total_usd"] += total
+        else:
+            by_phase_map[phase] = {
+                "phase": phase,
+                "runs": int(r["runs"]),
+                "total_usd": total,
+            }
+    by_phase_out = sorted(
+        by_phase_map.values(), key=lambda x: -x["total_usd"]
+    )
+    # by_day_map: sum agent_runs and media_assets per ISO date string.
     by_day_map = {r["d"]: float(r["total"] or 0) for r in day_rows}
+    for r in day_media_rows:
+        d = r["d"]
+        by_day_map[d] = by_day_map.get(d, 0.0) + float(r["total"] or 0)
     today_d = _date.today()
     by_day = []
     for i in range(14):
@@ -603,19 +724,11 @@ def _project_costs(h: "AicrewHandler", p: dict[str, str]) -> None:
         ds = d.isoformat()
         by_day.append({"date": ds, "total_usd": float(by_day_map.get(ds, 0))})
     h.send_json(200, {
-        "today_usd": float(today or 0),
-        "month_usd": float(month or 0),
+        "today_usd": today,
+        "month_usd": month,
         "budget_usd_month": float(project.get("budget_usd_month") or 0),
-        "by_role": [
-            {"role": r["role"], "runs": int(r["runs"]),
-             "total_usd": float(r["total"] or 0)}
-            for r in by_role_rows
-        ],
-        "by_phase": [
-            {"phase": r["phase"] or "(unknown)", "runs": int(r["runs"]),
-             "total_usd": float(r["total"] or 0)}
-            for r in by_phase_rows
-        ],
+        "by_role": by_role_out,
+        "by_phase": by_phase_out,
         "by_day": by_day,
     })
 

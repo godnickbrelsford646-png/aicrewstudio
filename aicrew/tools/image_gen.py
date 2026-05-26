@@ -64,6 +64,7 @@ class ImageResult:
     height: int
     model: str
     prompt: str
+    cost_usd: float = 0.0
 
 
 # A minimal 5x7 bitmap font for a few characters – enough to render seed labels
@@ -153,16 +154,27 @@ def generate_image(prompt: str, *, settings: Settings, idx: int = 0,
     h = hashlib.sha1((prompt + str(idx) + model).encode("utf-8")).hexdigest()[:16]
     filename = f"{h}.png"
     path = os.path.join(settings.media_dir, filename)
-    if os.path.exists(path):
-        return ImageResult(storage_url=f"/media/{filename}", mime="image/png",
-                           width=0, height=0, model=model, prompt=prompt)
-
     # Decide which provider to call.
     use_mock = (
         settings.use_mock_images
         or model.startswith("mock:")
         or model in ("", "mock")
     )
+    # Cost is known up-front for image generation (one image per call,
+    # static per-model rate). We attribute the same cost on cache hits
+    # so a re-run that resolves to a cached file does NOT add a phantom
+    # second charge — the dashboard sums media_assets rows, and only
+    # the original INSERT writes cost_usd into media_assets.
+    if use_mock:
+        cost_usd = 0.0
+    else:
+        from ..llm.pricing import estimate_image_cost
+        cost_usd = estimate_image_cost(model, count=1)
+    if os.path.exists(path):
+        return ImageResult(storage_url=f"/media/{filename}", mime="image/png",
+                           width=0, height=0, model=model, prompt=prompt,
+                           cost_usd=cost_usd)
+
     if use_mock:
         data = _placeholder_png(prompt, model, idx)
         width, height = 480, 270
@@ -179,6 +191,10 @@ def generate_image(prompt: str, *, settings: Settings, idx: int = 0,
             )
             data = _placeholder_png(prompt, model, idx, error=True)
             width, height = 480, 270
+            # Real call never reached the provider successfully — we
+            # ate a placeholder, not a billed image. Drop the cost so
+            # the dashboard does not over-report on transient failures.
+            cost_usd = 0.0
             try:
                 err_path = os.path.join(settings.media_dir, f"{h}.error.txt")
                 with open(err_path, "w", encoding="utf-8") as efh:
@@ -201,6 +217,7 @@ def generate_image(prompt: str, *, settings: Settings, idx: int = 0,
         width=width, height=height,
         model=model,
         prompt=prompt,
+        cost_usd=cost_usd,
     )
 
 

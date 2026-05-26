@@ -63,6 +63,7 @@ class VideoClipResult:
     duration_s: float
     model: str
     prompt: str
+    cost_usd: float = 0.0
 
 
 # Minimal-but-valid MP4 byte blob used in mock mode AND as the fallback when
@@ -140,12 +141,20 @@ def generate_video_clip(
         or model in ("", "mock")
         or not api_key
     )
+    # Cost is known up-front (Wan 2.2-i2v bills linearly by duration).
+    # Computed once; reused on cache hits and zeroed on real-call
+    # failures so the dashboard never over-reports on transient errors.
+    if use_mock:
+        cost_usd = 0.0
+    else:
+        from ..llm.pricing import estimate_video_cost
+        cost_usd = estimate_video_cost(model, duration_s=duration_s)
     # Cache hit: same prompt+image+idx+model already produced a clip.
     if os.path.exists(path):
         return VideoClipResult(
             storage_url=f"/media/{filename}", mime="video/mp4",
             width=1080, height=1920, duration_s=duration_s,
-            model=model, prompt=prompt,
+            model=model, prompt=prompt, cost_usd=cost_usd,
         )
     if use_mock:
         data = _placeholder_mp4(seed=f"{prompt}|{idx}|{model}")
@@ -164,6 +173,9 @@ def generate_video_clip(
                 "vclip_%s.error.txt for details.", exc, h,
             )
             data = _placeholder_mp4(seed=f"{prompt}|{idx}|{model}|err")
+            # Real call never reached the provider successfully —
+            # placeholder bytes cost nothing.
+            cost_usd = 0.0
             try:
                 err_path = os.path.join(settings.media_dir, f"vclip_{h}.error.txt")
                 with open(err_path, "w", encoding="utf-8") as efh:
@@ -189,6 +201,7 @@ def generate_video_clip(
         duration_s=duration_s,
         model=model,
         prompt=prompt,
+        cost_usd=cost_usd,
     )
 
 

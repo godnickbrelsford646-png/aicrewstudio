@@ -62,7 +62,7 @@ const TEAM_RU = {
 // are intentionally NOT in any team — they run regardless of which teams
 // are enabled.
 const TEXT_ROLES_LIST = ["researcher", "research_validator", "article_writer",
-                         "headline_writer", "qa_editorial"];
+                         "headline_writer", "fact_audit", "qa_editorial"];
 const VIDEO_ROLES_LIST = ["video_scenarist", "voice_director", "subtitle_styler"];
 
 function teamIdForAgent(a) {
@@ -82,6 +82,7 @@ const ROLE_RU = {
   article_writer: "Автор статьи",
   headline_writer: "Создатель заголовков",
   image_prompt_writer: "Промт-инженер картинок",
+  fact_audit: "Фактаудитор статьи",
   qa_editorial: "Редакторский QA",
   qa_visual: "Визуальный QA",
   channel_rewriter: "Адаптер для канала",
@@ -90,6 +91,15 @@ const ROLE_RU = {
   voice_director: "Режиссёр озвучки",
   subtitle_styler: "Стилизатор субтитров",
   video_assembler: "Сборщик видео",
+  // Synthetic media roles emitted by /api/projects/.../costs to attribute
+  // image/video/TTS/Whisper spend on the dashboard. They are NOT real
+  // agents — there is no agents row with role='__media_image__'. The
+  // double-underscore prefix is what tells the UI not to confuse them
+  // with real roles when rendering links / parameter forms.
+  __media_image__: "🖼 Картинки",
+  __media_video__: "🎬 Видеоклипы",
+  __media_audio__: "🔊 Озвучка (TTS)",
+  __media_subtitle__: "💬 Субтитры (Whisper)",
 };
 
 const ROLE_DESC = {
@@ -101,6 +111,7 @@ const ROLE_DESC = {
   article_writer: "Пишет большую универсальную статью на основе досье.",
   headline_writer: "Генерирует варианты заголовков в разных стилях.",
   image_prompt_writer: "Создаёт промты для генерации иллюстраций к статье.",
+  fact_audit: "Сравнивает готовый текст статьи с research-досье и удаляет утверждения, которых там нет (имена, цифры, цитаты).",
   qa_editorial: "Выбирает лучший заголовок, правит текст, ставит оценку.",
   qa_visual: "Выбирает лучшую картинку из сгенерированных вариантов.",
   channel_rewriter: "Адаптирует статью под формат и голос конкретного канала.",
@@ -109,6 +120,10 @@ const ROLE_DESC = {
   voice_director: "Нормализует закадровый текст под TTS: темп, SSML-паузы, длина.",
   subtitle_styler: "Превращает SRT (от Whisper) в стилизованные ASS-субтитры.",
   video_assembler: "Технический оркестратор: склеивает клипы, аудио и субтитры в финальный MP4.",
+  __media_image__: "Расходы на генерацию иллюстраций (Wan / Flux / DALL·E).",
+  __media_video__: "Расходы на генерацию видеоклипов (Wan i2v).",
+  __media_audio__: "Расходы на синтез речи (gpt-4o-mini-tts и аналоги).",
+  __media_subtitle__: "Расходы на расшифровку аудио (Whisper) для субтитров.",
 };
 
 const STATUS_RU = {
@@ -118,7 +133,7 @@ const STATUS_RU = {
   pending: "ожидает", scheduled: "запланирован", published: "опубликован",
 };
 
-const PHASE_RU = { topics: "Темы", articles: "Статьи", publication: "Публикация", full: "Полный цикл" };
+const PHASE_RU = { topics: "Темы", articles: "Статьи", publication: "Публикация", full: "Полный цикл", media: "Медиа", video: "Видео" };
 
 const CHANNEL_RU = {
   telegram: { label: "Telegram", icon: "✈", cls: "tg" },

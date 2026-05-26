@@ -548,8 +548,8 @@ class PipelineRunner:
             with db.connect(self.settings.db_path) as conn:
                 conn.execute(
                     "INSERT INTO media_assets (id, article_id, project_id, kind, language, prompt, "
-                    "model, storage_url, mime, width, height, chosen, meta, created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "model, storage_url, mime, width, height, chosen, cost_usd, meta, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         asset_id, first_article_id, project["id"], "image",
                         # language='multi' to signal that this asset is shared
@@ -558,6 +558,7 @@ class PipelineRunner:
                         "multi",
                         p["prompt"],
                         res.model, res.storage_url, res.mime, res.width, res.height, 0,
+                        float(res.cost_usd or 0.0),
                         db.jdump({"index": i, "negative": p.get("negative"),
                                    "topic_id": topic["id"]}),
                         db.now_iso(),
@@ -953,12 +954,13 @@ class PipelineRunner:
                 conn.execute(
                     "INSERT INTO media_assets (id, article_id, project_id, kind, "
                     "language, prompt, model, storage_url, mime, width, height, "
-                    "chosen, meta, created_at) VALUES "
-                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "chosen, cost_usd, meta, created_at) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         img_id, article_id, article["project_id"], "image",
                         lang, image_prompt, img.model, img.storage_url, img.mime,
                         img.width, img.height, 0,
+                        float(img.cost_usd or 0.0),
                         db.jdump({"scene_idx": idx, "purpose": "video_keyframe",
                                    "topic_id": article.get("topic_id")}),
                         db.now_iso(),
@@ -974,12 +976,13 @@ class PipelineRunner:
                 conn.execute(
                     "INSERT INTO media_assets (id, article_id, project_id, kind, "
                     "language, prompt, model, storage_url, mime, width, height, "
-                    "duration_s, chosen, meta, created_at) VALUES "
-                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "duration_s, chosen, cost_usd, meta, created_at) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         clip_id, article_id, article["project_id"], "video",
                         lang, i2v_prompt, clip.model, clip.storage_url, clip.mime,
                         clip.width, clip.height, clip.duration_s, 0,
+                        float(clip.cost_usd or 0.0),
                         db.jdump({"scene_idx": idx, "purpose": "video_scene_clip"}),
                         db.now_iso(),
                     ),
@@ -1024,12 +1027,13 @@ class PipelineRunner:
                 conn.execute(
                     "INSERT INTO media_assets (id, article_id, project_id, kind, "
                     "language, prompt, model, storage_url, mime, "
-                    "duration_s, chosen, meta, created_at) VALUES "
-                    "(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "duration_s, chosen, cost_usd, meta, created_at) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         tts_id, article_id, article["project_id"], "audio",
                         lang, text, tts.model, tts.storage_url, tts.mime,
                         tts.duration_s, 0,
+                        float(tts.cost_usd or 0.0),
                         db.jdump({"scene_idx": sc["idx"], "purpose": "voiceover",
                                    "voice_id": tts.voice_id}),
                         db.now_iso(),
@@ -1080,13 +1084,20 @@ class PipelineRunner:
             conn.execute(
                 "INSERT INTO media_assets (id, article_id, project_id, kind, "
                 "language, prompt, model, storage_url, mime, "
-                "chosen, meta, created_at) VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "chosen, cost_usd, meta, created_at) VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     ass_id, article_id, article["project_id"], "subtitle",
                     lang, "", "openai:whisper-1+subtitle_styler",
                     f"/media/{ass_filename}", "text/x-ass",
                     0,
+                    # Whisper bills per minute of input audio. We
+                    # attribute that cost to the subtitle asset (the
+                    # ASS file is the user-visible artefact of the
+                    # transcription step). subtitle_styler itself is
+                    # a regular LLM agent and is already billed via
+                    # agent_runs.
+                    float(srt.cost_usd or 0.0),
                     db.jdump({"format": "ass", "purpose": "final_subtitles",
                                "srt_duration_s": srt.duration_s}),
                     db.now_iso(),
@@ -1112,12 +1123,18 @@ class PipelineRunner:
             conn.execute(
                 "INSERT INTO media_assets (id, article_id, project_id, kind, "
                 "language, prompt, model, storage_url, mime, width, height, "
-                "duration_s, chosen, meta, created_at) VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "duration_s, chosen, cost_usd, meta, created_at) VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     final_id, article_id, article["project_id"], "video",
                     lang, "", video_model, final.storage_url, final.mime,
                     final.width, final.height, final.duration_s, 1,
+                    # Final assembled MP4 is a local ffmpeg merge of
+                    # already-billed scene clips + audio + ASS subs.
+                    # No external API call -> $0. The per-scene clip
+                    # rows (kind='video', purpose='video_scene_clip')
+                    # carry the actual Wan i2v charges.
+                    0.0,
                     db.jdump({"purpose": "final",
                                "scenes_count": len(scene_clips),
                                "aspect": self.VIDEO_ASPECT,
