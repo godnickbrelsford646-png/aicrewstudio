@@ -1277,5 +1277,95 @@ class FfmpegAssemblyTest(unittest.TestCase):
         self.assertEqual(out, self.audio_paths[0])
 
 
+class ProjectCostsEndpointTest(unittest.TestCase):
+    """Smoke test for GET /api/projects/<slug>/costs.
+
+    We don't spin up an HTTP server — we call the route handler directly
+    with a thin AicrewHandler stand-in, the same pattern used implicitly
+    by the rest of the test suite via PipelineRunner. The agent_runs
+    rows are inserted by the topic phase under PipelineSmokeTest's
+    seed; here we just call the cost helper to verify the JSON shape.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_costs_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "costs.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        self.settings = load_settings()
+
+    def test_costs_endpoint_returns_expected_shape(self) -> None:
+        # Seed and run topic+article phases so agent_runs has rows.
+        info = seed(self.settings)
+        runner = PipelineRunner(self.settings)
+        runner.run_topic_phase(info["project_id"])
+        runner.run_article_phase(info["project_id"], max_articles=1)
+
+        # Build a stand-in handler that captures the JSON payload the
+        # route would send.
+        from aicrew import api as api_mod
+        captured: dict = {}
+
+        class _StubHandler:
+            settings = self.settings
+            def send_json(self, status, payload):
+                captured["status"] = status
+                captured["payload"] = payload
+
+        # Resolve project slug.
+        with db.connect(self.settings.db_path) as conn:
+            proj = conn.execute(
+                "SELECT slug FROM projects WHERE id=?",
+                (info["project_id"],),
+            ).fetchone()
+        # Find the costs handler in the route table by pattern match.
+        handler = None
+        for method, pattern, fn in api_mod._ROUTES:
+            if method == "GET" and pattern == "/api/projects/{pkey}/costs":
+                handler = fn
+                break
+        self.assertIsNotNone(handler, "costs route is not registered")
+        handler(_StubHandler(), {"pkey": proj["slug"]})
+
+        self.assertEqual(captured["status"], 200)
+        payload = captured["payload"]
+        # Expected top-level keys.
+        for key in ("today_usd", "month_usd", "budget_usd_month",
+                    "by_role", "by_phase", "by_day"):
+            self.assertIn(key, payload, f"missing key {key}")
+        # Types and ranges.
+        self.assertIsInstance(payload["today_usd"], float)
+        self.assertIsInstance(payload["month_usd"], float)
+        self.assertIsInstance(payload["budget_usd_month"], float)
+        self.assertGreaterEqual(payload["today_usd"], 0)
+        self.assertGreaterEqual(payload["month_usd"], 0)
+        # 14-day timeseries, oldest-first, all entries shaped {date, total_usd}.
+        self.assertEqual(len(payload["by_day"]), 14)
+        for entry in payload["by_day"]:
+            self.assertIn("date", entry)
+            self.assertIn("total_usd", entry)
+            self.assertIsInstance(entry["total_usd"], float)
+        # by_role / by_phase entries (may be empty for a fresh project,
+        # but agent_runs definitely have rows after topic+article phases).
+        self.assertIsInstance(payload["by_role"], list)
+        self.assertIsInstance(payload["by_phase"], list)
+        # We just ran the topic phase, so we should see at least one
+        # phase entry. Mock cost is zero, so we only check structure
+        # (runs > 0).
+        self.assertGreater(len(payload["by_phase"]), 0,
+                            "expected at least one phase row after seeding "
+                            "and running a phase")
+        for r in payload["by_phase"]:
+            self.assertIn("phase", r)
+            self.assertIn("runs", r)
+            self.assertIn("total_usd", r)
+            self.assertGreaterEqual(r["runs"], 1)
+        # Same for by_role: topic_generator at minimum.
+        roles_seen = {r["role"] for r in payload["by_role"]}
+        self.assertIn("topic_generator", roles_seen)
+
+
 if __name__ == "__main__":
     unittest.main()

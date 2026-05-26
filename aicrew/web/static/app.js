@@ -391,6 +391,7 @@ async function runPhase(slug, phase) {
 // ---------- вкладка: пайплайн -----------------------------------------------
 
 function renderPipelineTab(data) {
+  const projectSlug = data.project.slug || data.project.id;
   const wrap = el("div", { class: "grid grid-2" });
   const phases = [
     { title: "1. Сбор тем", icon: "🔎", items: [
@@ -431,7 +432,112 @@ function renderPipelineTab(data) {
           el("td", {}, pill(r.status)),
           el("td", { class: "muted" }, fmtDate(r.started_at)),
           el("td", { class: "muted" }, fmtDate(r.finished_at)))))));
-  return el("div", {}, wrap, el("div", { class: "spacer" }), runsCard);
+  const costsCard = renderCostsCard(projectSlug);
+  return el("div", {}, costsCard, el("div", { class: "spacer" }),
+            wrap, el("div", { class: "spacer" }), runsCard);
+}
+
+// ---------- стоимости -------------------------------------------------------
+
+function renderCostsCard(projectSlug) {
+  // Loads /api/projects/<slug>/costs asynchronously and re-renders inside
+  // the same card node when data arrives. We do not block the Pipeline
+  // tab on this query — phases / runs render immediately.
+  const card = el("div", { class: "card" },
+    el("h2", {}, "💰 Расходы"), loading("Считаем стоимость…"));
+  api(`/api/projects/${projectSlug}/costs`).then(data => {
+    card.innerHTML = "";
+    card.append(el("h2", {}, "💰 Расходы"));
+    card.append(renderCostsContent(data));
+  }).catch(e => {
+    card.innerHTML = "";
+    card.append(el("h2", {}, "💰 Расходы"));
+    card.append(el("div", { class: "muted" }, "Не удалось загрузить: " + e.message));
+  });
+  return card;
+}
+
+function fmtUsd(v) {
+  const n = Number(v) || 0;
+  if (n === 0) return "$0.00";
+  if (n < 0.01) return "<$0.01";
+  return "$" + n.toFixed(2);
+}
+
+function renderCostsContent(data) {
+  const today = Number(data.today_usd) || 0;
+  const month = Number(data.month_usd) || 0;
+  const budget = Number(data.budget_usd_month) || 0;
+  const pct = budget > 0 ? Math.min(100, (month / budget) * 100) : 0;
+  const overBudget = budget > 0 && month > budget;
+  // 1) Three big metrics + budget progress bar.
+  const metricsRow = el("div", { class: "cost-metrics" },
+    el("div", { class: "cost-metric" },
+      el("div", { class: "cost-metric-label" }, "Сегодня"),
+      el("div", { class: "cost-metric-value" }, fmtUsd(today))),
+    el("div", { class: "cost-metric" },
+      el("div", { class: "cost-metric-label" }, "За 30 дней"),
+      el("div", { class: "cost-metric-value" }, fmtUsd(month))),
+    el("div", { class: "cost-metric" },
+      el("div", { class: "cost-metric-label" }, "Бюджет / мес"),
+      el("div", { class: "cost-metric-value" }, fmtUsd(budget)))
+  );
+  const progress = budget > 0 ? el("div", { class: "cost-progress-wrap" },
+    el("div", { class: "cost-progress-bar" + (overBudget ? " over" : "") },
+      el("div", { class: "cost-progress-fill",
+        style: "width:" + pct.toFixed(1) + "%" })),
+    el("div", { class: "cost-progress-label" + (overBudget ? " over" : "") },
+      overBudget
+        ? `⚠️ Превышение: ${pct.toFixed(0)}% бюджета`
+        : `${pct.toFixed(0)}% бюджета · осталось ${fmtUsd(Math.max(0, budget - month))}`)
+  ) : el("div", { class: "muted sm" },
+       "Бюджет не задан (см. вкладку «Настройки»).");
+
+  // 2) 14-day bar chart.
+  const days = data.by_day || [];
+  const maxV = Math.max(0.01, ...days.map(d => d.total_usd));
+  const chart = el("div", { class: "cost-chart" },
+    ...days.map(d => {
+      const h = (d.total_usd / maxV) * 100;
+      const bar = el("div", { class: "cost-chart-bar",
+        title: `${d.date}: ${fmtUsd(d.total_usd)}`,
+        style: "height:" + (d.total_usd > 0 ? Math.max(2, h) : 0) + "%" });
+      const dayLabel = d.date.slice(8, 10);
+      return el("div", { class: "cost-chart-col" }, bar,
+        el("div", { class: "cost-chart-label" }, dayLabel));
+    }));
+  const chartWrap = el("div", { class: "card-section" },
+    el("h3", {}, "Расходы по дням (14 дней)"),
+    chart);
+
+  // 3) Top spenders by role.
+  const byRole = data.by_role || [];
+  const roleTable = byRole.length === 0
+    ? el("div", { class: "muted sm" }, "Запусков пока нет.")
+    : el("table", {},
+        el("thead", {}, el("tr", {},
+          el("th", {}, "Роль"),
+          el("th", { style: "text-align:right" }, "Запусков"),
+          el("th", { style: "text-align:right" }, "Сумма"))),
+        el("tbody", {}, ...byRole.slice(0, 10).map(r => el("tr", {},
+          el("td", {}, ROLE_RU[r.role] || r.role),
+          el("td", { class: "muted", style: "text-align:right" }, r.runs),
+          el("td", { style: "text-align:right;font-weight:600" }, fmtUsd(r.total_usd))))));
+  const roleWrap = el("div", { class: "card-section" },
+    el("h3", {}, "Топ по ролям"),
+    roleTable);
+
+  // 4) By phase (smaller, as a row of pills).
+  const byPhase = data.by_phase || [];
+  const phaseWrap = byPhase.length === 0 ? null : el("div", { class: "card-section" },
+    el("h3", {}, "По фазам пайплайна"),
+    el("div", { class: "cost-phases" },
+      ...byPhase.map(p => el("div", { class: "cost-phase" },
+        el("div", { class: "cost-phase-name" }, PHASE_RU[p.phase] || p.phase),
+        el("div", { class: "cost-phase-value" }, fmtUsd(p.total_usd)),
+        el("div", { class: "cost-phase-runs muted" }, "(" + p.runs + ")")))));
+
+  return el("div", {}, metricsRow, progress, chartWrap, roleWrap, phaseWrap);
 }
 
 // ---------- вкладка: агенты -------------------------------------------------

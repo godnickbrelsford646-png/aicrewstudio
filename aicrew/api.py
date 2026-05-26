@@ -522,6 +522,104 @@ def _list_posts(h: "AicrewHandler", p: dict[str, str]) -> None:
     h.send_json(200, {"posts": rows})
 
 
+@route("GET", "/api/projects/{pkey}/costs")
+def _project_costs(h: "AicrewHandler", p: dict[str, str]) -> None:
+    """Cost summary for the project's main dashboard.
+
+    Aggregates ``agent_runs.cost_usd`` (summed) over every run that belongs
+    to a ``pipeline_run`` of this project. Returns:
+
+      - today_usd       : sum since UTC midnight today
+      - month_usd       : sum over the last 30 days
+      - budget_usd_month: from projects.budget_usd_month
+      - by_role[]       : top spenders per agent role (last 30 days)
+      - by_phase[]      : split by pipeline_runs.kind (topics / articles
+                          / publication / video / full)
+      - by_day[]        : 14-day timeseries with zero-fill, oldest first,
+                          for the bar chart on the Pipeline tab.
+
+    All sums are floats in USD (we never round on the wire — UI rounds
+    for display).
+    """
+    from datetime import date as _date, timedelta as _td
+    project = _resolve_project(h, p["pkey"])
+    if project is None:
+        return
+    pid = project["id"]
+    with db.connect(h.settings.db_path) as conn:
+        today = conn.execute(
+            "SELECT COALESCE(SUM(ar.cost_usd), 0) AS total "
+            "FROM agent_runs ar "
+            "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
+            "WHERE pr.project_id = ? AND date(ar.started_at) = date('now')",
+            (pid,),
+        ).fetchone()["total"]
+        month = conn.execute(
+            "SELECT COALESCE(SUM(ar.cost_usd), 0) AS total "
+            "FROM agent_runs ar "
+            "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
+            "WHERE pr.project_id = ? "
+            "AND ar.started_at >= datetime('now', '-30 days')",
+            (pid,),
+        ).fetchone()["total"]
+        by_role_rows = conn.execute(
+            "SELECT COALESCE(a.role, '(unknown)') AS role, "
+            "COUNT(*) AS runs, "
+            "COALESCE(SUM(ar.cost_usd), 0) AS total "
+            "FROM agent_runs ar "
+            "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
+            "LEFT JOIN agents a ON a.id = ar.agent_id "
+            "WHERE pr.project_id = ? "
+            "AND ar.started_at >= datetime('now', '-30 days') "
+            "GROUP BY a.role ORDER BY total DESC, runs DESC",
+            (pid,),
+        ).fetchall()
+        by_phase_rows = conn.execute(
+            "SELECT pr.kind AS phase, COUNT(*) AS runs, "
+            "COALESCE(SUM(ar.cost_usd), 0) AS total "
+            "FROM agent_runs ar "
+            "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
+            "WHERE pr.project_id = ? "
+            "AND ar.started_at >= datetime('now', '-30 days') "
+            "GROUP BY pr.kind ORDER BY total DESC",
+            (pid,),
+        ).fetchall()
+        # 14-day timeseries (oldest-first), zero-filled for missing days.
+        day_rows = conn.execute(
+            "SELECT date(ar.started_at) AS d, "
+            "COALESCE(SUM(ar.cost_usd), 0) AS total "
+            "FROM agent_runs ar "
+            "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
+            "WHERE pr.project_id = ? "
+            "AND ar.started_at >= datetime('now', '-13 days') "
+            "GROUP BY date(ar.started_at)",
+            (pid,),
+        ).fetchall()
+    by_day_map = {r["d"]: float(r["total"] or 0) for r in day_rows}
+    today_d = _date.today()
+    by_day = []
+    for i in range(14):
+        d = today_d - _td(days=13 - i)
+        ds = d.isoformat()
+        by_day.append({"date": ds, "total_usd": float(by_day_map.get(ds, 0))})
+    h.send_json(200, {
+        "today_usd": float(today or 0),
+        "month_usd": float(month or 0),
+        "budget_usd_month": float(project.get("budget_usd_month") or 0),
+        "by_role": [
+            {"role": r["role"], "runs": int(r["runs"]),
+             "total_usd": float(r["total"] or 0)}
+            for r in by_role_rows
+        ],
+        "by_phase": [
+            {"phase": r["phase"] or "(unknown)", "runs": int(r["runs"]),
+             "total_usd": float(r["total"] or 0)}
+            for r in by_phase_rows
+        ],
+        "by_day": by_day,
+    })
+
+
 @route("POST", "/api/posts/{post_id}/publish_now")
 def _publish_now(h: "AicrewHandler", p: dict[str, str]) -> None:
     """Publish an existing scheduled post immediately, ignoring its slot.
