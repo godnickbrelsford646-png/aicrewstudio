@@ -1,19 +1,31 @@
-"""Text-to-speech tool. Mock + real-API skeleton (OpenAI gpt-4o-mini-tts).
+"""Text-to-speech tool. Real OpenAI gpt-4o-mini-tts + mock fallback.
+
+Routing by model string (mirrors aicrew/tools/image_gen.py):
+  - ``mock:placeholder`` (or empty / "mock") -> placeholder MP3 (no API call).
+  - ``openai:<model>`` -> POST https://api.openai.com/v1/audio/speech
+                         using $OPENAI_API_KEY.
+  - ``302ai:<model>``  -> POST https://api.302.ai/v1/audio/speech
+                         using $AI302_API_KEY (302.ai proxies the OpenAI
+                         /v1/audio/speech endpoint shape unchanged).
 
 Mock mode writes a tiny but well-formed MP3 placeholder under
-``settings.media_dir`` and returns a ``/media/<file>.mp3`` URL. The placeholder
-has a valid ID3v2 header followed by a couple of bytes that look like an MP3
-frame sync — enough for browsers/OS to identify it as ``audio/mpeg``.
+``settings.media_dir`` and returns a ``/media/<file>.mp3`` URL — every
+magic-byte sniffer recognises it as ``audio/mpeg``, browsers will refuse
+to play it (junk frame body) but the pipeline can still chain.
 
-Real path: ``openai:gpt-4o-mini-tts`` via /v1/audio/speech (skeleton only —
-never called in sandbox).
+Real path returns the actual MP3 bytes from the provider; for
+``gpt-4o-mini-tts`` the response Content-Type is ``audio/mpeg`` and the
+body is the raw MP3 file.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 
 from ..settings import Settings
@@ -84,7 +96,14 @@ def generate_tts(
     # clear narration). Min 2 seconds so a one-word voiceover still has
     # plausible duration metadata.
     duration_s = max(2.0, len(text) / 15.0)
-    api_key = os.environ.get("OPENAI_API_KEY", "")
+    # Choose the API key that matches the model namespace. If the user
+    # has only AI302_API_KEY set we should use the 302.ai proxy of the
+    # OpenAI TTS endpoint, not silently fall back to mock.
+    if model.startswith("302ai:"):
+        api_key = os.environ.get("AI302_API_KEY", "")
+    else:
+        # 'openai:...' or bare model name (treated as OpenAI).
+        api_key = os.environ.get("OPENAI_API_KEY", "")
     use_mock = (
         model.startswith("mock:")
         or model in ("", "mock")
@@ -99,10 +118,34 @@ def generate_tts(
         data = _placeholder_mp3(seed=f"{text[:80]}|{idx}|{voice_id}")
     else:
         try:
-            data = _call_openai_tts(text, voice_id, speed, api_key)
+            data = _call_real_tts(text, model, voice_id, speed)
         except Exception as exc:
-            log.exception("TTS provider failed, falling back to placeholder: %s", exc)
+            log.exception("TTS provider failed, falling back to placeholder")
+            log.warning(
+                "TTS generation failed: %s. Common causes: out of credits "
+                "on OpenAI/302.ai, wrong voice id, or content blocked by "
+                "the provider's safety filter. See sidecar tts_%s.error.txt "
+                "for details.", exc, h,
+            )
             data = _placeholder_mp3(seed=f"{text[:80]}|{idx}|{voice_id}|err")
+            try:
+                err_path = os.path.join(settings.media_dir, f"tts_{h}.error.txt")
+                with open(err_path, "w", encoding="utf-8") as efh:
+                    efh.write(
+                        f"TTS generation failed\n"
+                        f"model: {model}\n"
+                        f"voice_id: {voice_id}\n"
+                        f"speed: {speed}\n"
+                        f"language: {language}\n"
+                        f"text (first 500 chars): {text[:500]}\n"
+                        f"error: {exc}\n"
+                        f"hint: check OpenAI/302.ai credits and that "
+                        f"voice_id is one of the supported voices "
+                        f"(alloy, ash, ballad, coral, echo, fable, "
+                        f"nova, onyx, sage, shimmer, verse).\n"
+                    )
+            except Exception:  # pragma: no cover - diagnostic best-effort
+                log.exception("failed to write TTS error sidecar file")
     with open(path, "wb") as fh:
         fh.write(data)
     return TTSResult(
@@ -115,28 +158,86 @@ def generate_tts(
 
 
 # ---------------------------------------------------------------------------
-# Real OpenAI TTS skeleton — NEVER called in sandbox / mock mode.
+# Real OpenAI / 302.ai TTS path.
 # ---------------------------------------------------------------------------
 
 
-def _call_openai_tts(text: str, voice_id: str, speed: float, api_key: str) -> bytes:
-    """Skeleton for OpenAI gpt-4o-mini-tts call.
+def _call_real_tts(text: str, model: str, voice_id: str, speed: float) -> bytes:
+    """Routes to OpenAI or 302.ai based on the model namespace prefix.
 
-    Wire format:
-        POST https://api.openai.com/v1/audio/speech
-        Authorization: Bearer <OPENAI_API_KEY>
+    Both providers expose the same ``/v1/audio/speech`` endpoint shape;
+    only the base URL and the API key differ.
+    """
+    if model.startswith("302ai:"):
+        real_model = model.split(":", 1)[1]
+        api_key = os.environ.get("AI302_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("AI302_API_KEY is empty in environment.")
+        base_url = "https://api.302.ai/v1"
+    else:
+        # 'openai:...' or bare model -> OpenAI native.
+        real_model = model.split(":", 1)[1] if ":" in model else model
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is empty in environment.")
+        base_url = "https://api.openai.com/v1"
+    return _call_openai_tts(text, real_model, voice_id, speed, api_key, base_url)
+
+
+def _call_openai_tts(text: str, real_model: str, voice_id: str, speed: float,
+                      api_key: str, base_url: str) -> bytes:
+    """Synchronous call to ``/v1/audio/speech``.
+
+    Wire format::
+
+        POST {base_url}/audio/speech
+        Authorization: Bearer <api_key>
         Content-Type: application/json
         {
-            "model": "gpt-4o-mini-tts",
-            "input": <text>,
-            "voice": <voice_id>,    # e.g. "onyx", "alloy", "verse"
-            "speed": <float>,       # 0.25..4.0
+            "model":           "gpt-4o-mini-tts",
+            "input":           <text>,
+            "voice":           <voice_id>,    # alloy / ash / ballad / coral
+                                              # / echo / fable / nova / onyx
+                                              # / sage / shimmer / verse
+            "speed":           <float>,       # 0.25..4.0
             "response_format": "mp3"
         }
         -> 200 OK with body = MP3 bytes (Content-Type: audio/mpeg).
 
-    Cost: ~$0.015 / minute of synthesised audio at the time of writing.
+    Cost: ≈$0.015 / minute of synthesised audio at the time of writing.
+
+    OpenAI's TTS endpoint does not enforce a fixed input limit per request
+    but practical voiceovers are short — we trim to 4096 chars defensively
+    so a runaway voice_director output cannot accidentally cause a 400.
     """
-    raise NotImplementedError(
-        "Real OpenAI TTS call is a skeleton; sandbox has no internet."
+    body = {
+        "model": real_model,
+        "input": text[:4096],
+        "voice": voice_id,
+        "speed": float(speed),
+        "response_format": "mp3",
+    }
+    url = base_url.rstrip("/") + "/audio/speech"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    log.info("tts: call model=%s voice=%s speed=%.2f endpoint=%s text=%r",
+             real_model, voice_id, speed, url, text[:100])
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"),
+        headers=headers, method="POST",
     )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        log.error("tts HTTP %s: %s", exc.code, err_body[:500])
+        raise RuntimeError(
+            f"TTS provider returned HTTP {exc.code}: {err_body[:300]}"
+        ) from exc
+    if not data:
+        raise RuntimeError("TTS provider returned empty body")
+    log.info("tts ok: model=%s voice=%s bytes=%d", real_model, voice_id, len(data))
+    return data

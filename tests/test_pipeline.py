@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock as _mock
 
 from aicrew import db
@@ -746,6 +747,147 @@ class WanI2VAsyncFlowTest(unittest.TestCase):
             err_content = fh.read()
         self.assertIn("img_url not reachable", err_content)
         self.assertIn("302ai:wan2.2-i2v", err_content)
+
+
+class OpenAITTSFlowTest(unittest.TestCase):
+    """Tests the real OpenAI gpt-4o-mini-tts /v1/audio/speech flow.
+
+    Mocks urllib.request.urlopen and verifies:
+      1. POST goes to https://api.openai.com/v1/audio/speech;
+      2. body has the correct model/voice/speed/input fields and
+         response_format='mp3';
+      3. the response bytes are saved verbatim as the local .mp3.
+    Also covers the 302.ai proxy variant ('302ai:gpt-4o-mini-tts'):
+      * the request goes to https://api.302.ai/v1/audio/speech;
+      * AI302_API_KEY is used (not OPENAI_API_KEY);
+      * the bare model name ('gpt-4o-mini-tts') ends up in the body.
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="aicrew_tts_")
+        os.environ["AICREW_DB"] = os.path.join(self.tmpdir, "tts.db")
+        os.environ["AICREW_LLM_PROVIDER"] = "mock"
+        os.environ["AICREW_IMAGE_PROVIDER"] = "mock"
+        os.environ["AICREW_SEARCH_PROVIDER"] = "mock"
+        os.environ["AICREW_MEDIA_DIR"] = os.path.join(self.tmpdir, "media")
+        self.settings = load_settings()
+
+    def tearDown(self) -> None:
+        for k in ("OPENAI_API_KEY", "AI302_API_KEY"):
+            os.environ.pop(k, None)
+
+    def _mp3_bytes(self) -> bytes:
+        # Tiny but valid-looking MP3 body that the provider would return.
+        return b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\xff\xfb" + b"\x00" * 64
+
+    def test_openai_tts_request_and_save(self) -> None:
+        from aicrew.tools import tts_gen
+        os.environ["OPENAI_API_KEY"] = "sk-openai-test"
+        mp3 = self._mp3_bytes()
+        seen: list[tuple[str, str, bytes, dict]] = []
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+            method = req.get_method()
+            data = req.data or b""
+            headers = dict(req.headers) if hasattr(req, "headers") else {}
+            seen.append((url, method, data, headers))
+            return _http_response(mp3)
+
+        with _mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = tts_gen.generate_tts(
+                "Здравствуйте, это тест озвучки.",
+                settings=self.settings, idx=1,
+                model="openai:gpt-4o-mini-tts",
+                voice_id="onyx", speed=1.1, language="ru",
+            )
+
+        self.assertEqual(len(seen), 1, "expected exactly one HTTP call")
+        url, method, body_raw, headers = seen[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, "https://api.openai.com/v1/audio/speech")
+        # Authorization header carries the OpenAI key.
+        # urllib lower-cases header keys when storing them.
+        auth = headers.get("Authorization") or headers.get("authorization") or ""
+        self.assertEqual(auth, "Bearer sk-openai-test")
+        body = json.loads(body_raw.decode("utf-8"))
+        self.assertEqual(body["model"], "gpt-4o-mini-tts")
+        self.assertEqual(body["voice"], "onyx")
+        self.assertEqual(body["speed"], 1.1)
+        self.assertEqual(body["input"], "Здравствуйте, это тест озвучки.")
+        self.assertEqual(body["response_format"], "mp3")
+        # MP3 bytes saved on disk under media_dir.
+        local_path = os.path.join(
+            self.settings.media_dir, res.storage_url.rsplit("/", 1)[-1],
+        )
+        self.assertTrue(os.path.exists(local_path))
+        with open(local_path, "rb") as fh:
+            saved = fh.read()
+        self.assertEqual(saved, mp3)
+        self.assertEqual(res.mime, "audio/mpeg")
+
+    def test_302ai_tts_uses_proxy_endpoint_and_key(self) -> None:
+        from aicrew.tools import tts_gen
+        os.environ["AI302_API_KEY"] = "sk-302-test"
+        mp3 = self._mp3_bytes()
+        seen: list[tuple[str, str, bytes, dict]] = []
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+            method = req.get_method()
+            data = req.data or b""
+            headers = dict(req.headers) if hasattr(req, "headers") else {}
+            seen.append((url, method, data, headers))
+            return _http_response(mp3)
+
+        with _mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            tts_gen.generate_tts(
+                "Hello world.",
+                settings=self.settings, idx=2,
+                model="302ai:gpt-4o-mini-tts",
+                voice_id="echo", speed=1.0, language="en",
+            )
+        url, method, body_raw, headers = seen[0]
+        self.assertEqual(url, "https://api.302.ai/v1/audio/speech")
+        auth = headers.get("Authorization") or headers.get("authorization") or ""
+        self.assertEqual(auth, "Bearer sk-302-test")
+        body = json.loads(body_raw.decode("utf-8"))
+        # Bare model name (without the 302ai: prefix) goes in the body.
+        self.assertEqual(body["model"], "gpt-4o-mini-tts")
+        self.assertEqual(body["voice"], "echo")
+
+    def test_tts_http_error_writes_sidecar_and_uses_placeholder(self) -> None:
+        from aicrew.tools import tts_gen
+        os.environ["OPENAI_API_KEY"] = "sk-openai-test"
+
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 401, "Unauthorized",
+                {}, io.BytesIO(b'{"error":{"message":"bad key"}}'),
+            )
+
+        with _mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = tts_gen.generate_tts(
+                "anything",
+                settings=self.settings, idx=3,
+                model="openai:gpt-4o-mini-tts",
+                voice_id="onyx",
+            )
+        # We get a placeholder, not garbage from the failed call.
+        self.assertTrue(res.storage_url.startswith("/media/"))
+        files = os.listdir(self.settings.media_dir)
+        err_files = [f for f in files
+                     if f.startswith("tts_") and f.endswith(".error.txt")]
+        self.assertEqual(
+            len(err_files), 1,
+            f"expected one tts error sidecar; got {files}",
+        )
+        with open(os.path.join(self.settings.media_dir, err_files[0]),
+                  "r", encoding="utf-8") as fh:
+            err_content = fh.read()
+        self.assertIn("HTTP 401", err_content)
+        self.assertIn("openai:gpt-4o-mini-tts", err_content)
+        self.assertIn("onyx", err_content)
 
 
 if __name__ == "__main__":
