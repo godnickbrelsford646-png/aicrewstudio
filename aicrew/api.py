@@ -17,11 +17,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
 from . import db
-from .agents.registry import role_spec
+from .agents.registry import (
+    default_agents_for_project,
+    default_enabled_teams,
+    role_spec,
+)
 from .agents.param_schema import schema_payload
 from .channels.registry import CHANNEL_KINDS, list_kinds
 from .crypto import decrypt, encrypt, mask
 from .pipeline import PipelineRunner
+from .scheduler import (
+    now_utc_iso,
+    publish_one_post,
+    start_scheduler,
+)
 from .settings import Settings, load_settings
 
 log = logging.getLogger("aicrew.api")
@@ -113,6 +122,23 @@ def _get_project(h: "AicrewHandler", p: dict[str, str]) -> None:
     if project is None:
         return
     pid = project["id"]
+    # Parse enabled_teams JSON column for the wire. Older projects may
+    # have it NULL/empty (the DB-level backfill in init_schema covers
+    # most cases, but defensive parsing avoids 500s on partially-migrated
+    # rows). Fall back to the language_modes-based default so the UI
+    # always sees a non-empty list.
+    try:
+        project["enabled_teams"] = json.loads(project.get("enabled_teams") or "[]")
+        if not isinstance(project["enabled_teams"], list):
+            project["enabled_teams"] = []
+    except (json.JSONDecodeError, TypeError):
+        project["enabled_teams"] = []
+    if not project["enabled_teams"]:
+        try:
+            langs = json.loads(project.get("language_modes") or '["ru"]')
+        except (json.JSONDecodeError, TypeError):
+            langs = ["ru"]
+        project["enabled_teams"] = default_enabled_teams(langs)
     with db.connect(h.settings.db_path) as conn:
         agents = db.rows_to_list(conn.execute(
             "SELECT * FROM agents WHERE project_id=? ORDER BY role, language", (pid,)
@@ -125,9 +151,33 @@ def _get_project(h: "AicrewHandler", p: dict[str, str]) -> None:
             "SELECT * FROM articles WHERE project_id=? ORDER BY created_at DESC LIMIT 50",
             (pid,),
         ).fetchall())
+        # Channels: we sort connected ones first so the user sees what's
+        # already plugged in at the top of the Channels tab. We never expose
+        # the encrypted blob to the browser — replace it with a boolean
+        # is_connected flag.
+        #
+        # Critically, "is_connected" is NOT just "credentials_enc is non-empty":
+        # seed.py writes an encrypted empty dict {} for every freshly created
+        # channel (so the column is never NULL). We must decrypt and verify
+        # that at least one real value is present.
         channels = db.rows_to_list(conn.execute(
-            "SELECT * FROM channels WHERE project_id=? ORDER BY name", (pid,)
+            "SELECT * FROM channels WHERE project_id=? ORDER BY name",
+            (pid,),
         ).fetchall())
+        for ch in channels:
+            enc = (ch.pop("credentials_enc", "") or "").strip()
+            connected = False
+            if enc:
+                try:
+                    raw = json.loads(decrypt(enc, h.settings.master_key))
+                    connected = bool(raw) and any(
+                        str(v).strip() for v in raw.values() if v is not None
+                    )
+                except Exception:
+                    connected = False
+            ch["is_connected"] = connected
+        # Stable sort: connected first, then alphabetical by name.
+        channels.sort(key=lambda c: (0 if c["is_connected"] else 1, c["name"]))
         runs = db.rows_to_list(conn.execute(
             "SELECT * FROM pipeline_runs WHERE project_id=? ORDER BY started_at DESC LIMIT 20",
             (pid,),
@@ -146,7 +196,7 @@ def _patch_project(h: "AicrewHandler", p: dict[str, str]) -> None:
     body = h.read_json() or {}
     allowed = {"name", "niche", "description", "is_enabled", "timezone",
                "language_modes", "daily_topics_target", "daily_articles_target",
-               "budget_usd_month", "style_guide"}
+               "budget_usd_month", "style_guide", "enabled_teams"}
     sets = []
     args: list[Any] = []
     for k, v in body.items():
@@ -154,6 +204,11 @@ def _patch_project(h: "AicrewHandler", p: dict[str, str]) -> None:
             continue
         sets.append(f"{k}=?")
         if k == "language_modes" and isinstance(v, list):
+            args.append(json.dumps(v))
+        elif k == "enabled_teams" and isinstance(v, list):
+            # Same JSON-in-string convention as language_modes. The UI
+            # sends a list of team ids (e.g. ["text_ru","video_ru"]);
+            # we serialise to JSON so SQLite stores a TEXT column.
             args.append(json.dumps(v))
         else:
             args.append(v)
@@ -320,19 +375,56 @@ def _get_channel_by_slug(h: "AicrewHandler", p: dict[str, str]) -> None:
             "SELECT * FROM channel_slots WHERE channel_id=? ORDER BY time_local",
             (channel["id"],),
         ).fetchall())
+        # The channel page only shows the channel-specific rewriter agent
+        # (per the product decision: every channel has exactly one adapter,
+        # the shared editorial/topic/media teams are visible from the
+        # project's Agents tab and shouldn't be duplicated here).
+        rewriter_id = channel.get("rewriter_agent_id") or ""
+        rewriter_row = None
+        if rewriter_id:
+            rewriter_row = conn.execute(
+                "SELECT id, slug, role, language, display_name, model, "
+                "channel_id, is_enabled FROM agents WHERE id=?",
+                (rewriter_id,),
+            ).fetchone()
+        if rewriter_row is None:
+            # Fallback: an older project may not have rewriter_agent_id set,
+            # but the rewriter still exists with channel_id=channel.id.
+            rewriter_row = conn.execute(
+                "SELECT id, slug, role, language, display_name, model, "
+                "channel_id, is_enabled FROM agents "
+                "WHERE project_id=? AND role='channel_rewriter' AND channel_id=?",
+                (project["id"], channel["id"]),
+            ).fetchone()
+    rewriter_agent = db.row_to_dict(rewriter_row) if rewriter_row else None
     creds_masked: dict[str, str] = {}
+    is_connected = False
     if channel.get("credentials_enc"):
         try:
             raw = json.loads(decrypt(channel["credentials_enc"], h.settings.master_key))
             creds_masked = {k: mask(str(v)) for k, v in raw.items()}
+            # is_connected only when at least one real value is filled in;
+            # encrypted empty {} (default seed state) does NOT count as
+            # connected. Same logic as in _get_project.
+            is_connected = bool(raw) and any(
+                str(v).strip() for v in raw.values() if v is not None
+            )
         except Exception:
             pass
     channel["credentials_masked"] = creds_masked
+    channel["is_connected"] = is_connected
     channel.pop("credentials_enc", None)
     h.send_json(200, {
-        "project": {"id": project["id"], "slug": project["slug"], "name": project["name"]},
+        "project": {"id": project["id"], "slug": project["slug"],
+                    "name": project["name"],
+                    # Surface timezone so the channel page can label slot
+                    # times correctly ("local time of project, timezone=...").
+                    "timezone": project.get("timezone") or "UTC"},
         "channel": channel, "slots": slots,
         "spec": _kind_payload(channel["kind"]),
+        # Only the per-channel adapter is exposed here. None for video
+        # channels (they have no rewriter yet).
+        "rewriter_agent": rewriter_agent,
     })
 
 
@@ -430,6 +522,314 @@ def _list_posts(h: "AicrewHandler", p: dict[str, str]) -> None:
     h.send_json(200, {"posts": rows})
 
 
+@route("GET", "/api/projects/{pkey}/costs")
+def _project_costs(h: "AicrewHandler", p: dict[str, str]) -> None:
+    """Cost summary for the project's main dashboard.
+
+    Aggregates two cost sources side by side:
+      * ``agent_runs.cost_usd`` — every LLM call invoked through the
+        agent executor (joined back to the project via pipeline_runs).
+      * ``media_assets.cost_usd`` — image / video / TTS / Whisper
+        spend, attributed directly to the project (the image/video
+        tools write the per-call cost into media_assets at INSERT time
+        — see aicrew/llm/pricing.py for rate cards).
+
+    Returns:
+      - today_usd       : sum since UTC midnight today (LLM + media)
+      - month_usd       : sum over the last 30 days       (LLM + media)
+      - budget_usd_month: from projects.budget_usd_month
+      - by_role[]       : top spenders. Real agent roles plus four
+                          synthetic ``__media_{kind}__`` rows
+                          (image / video / audio / subtitle), only
+                          included when their total is > 0.
+      - by_phase[]      : pipeline_runs.kind (topics / articles /
+                          publication / video / full) plus two
+                          synthetic phases:
+                            * 'media' = image+audio+subtitle assets
+                            * 'video' = Wan i2v scene clips
+                          Synthetic rows are merged into the matching
+                          pipeline phase (so a video pipeline run +
+                          its scene clips live on one 'video' row).
+      - by_day[]        : 14-day timeseries with zero-fill, oldest
+                          first, summing both sources per day.
+
+    All sums are floats in USD (we never round on the wire — UI rounds
+    for display).
+    """
+    from datetime import date as _date, timedelta as _td
+    project = _resolve_project(h, p["pkey"])
+    if project is None:
+        return
+    pid = project["id"]
+    with db.connect(h.settings.db_path) as conn:
+        # ---- today_usd: agent_runs + media_assets, both today (UTC) ----
+        today_agents = conn.execute(
+            "SELECT COALESCE(SUM(ar.cost_usd), 0) AS total "
+            "FROM agent_runs ar "
+            "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
+            "WHERE pr.project_id = ? AND date(ar.started_at) = date('now')",
+            (pid,),
+        ).fetchone()["total"]
+        today_media = conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM media_assets "
+            "WHERE project_id = ? AND date(created_at) = date('now')",
+            (pid,),
+        ).fetchone()["total"]
+        today = float(today_agents or 0) + float(today_media or 0)
+        # ---- month_usd: same shape, last 30 days ----
+        month_agents = conn.execute(
+            "SELECT COALESCE(SUM(ar.cost_usd), 0) AS total "
+            "FROM agent_runs ar "
+            "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
+            "WHERE pr.project_id = ? "
+            "AND ar.started_at >= datetime('now', '-30 days')",
+            (pid,),
+        ).fetchone()["total"]
+        month_media = conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM media_assets "
+            "WHERE project_id = ? "
+            "AND created_at >= datetime('now', '-30 days')",
+            (pid,),
+        ).fetchone()["total"]
+        month = float(month_agents or 0) + float(month_media or 0)
+        # ---- by_role[]: agent runs by role + synthetic __media_{kind}__ ----
+        by_role_rows = conn.execute(
+            "SELECT COALESCE(a.role, '(unknown)') AS role, "
+            "COUNT(*) AS runs, "
+            "COALESCE(SUM(ar.cost_usd), 0) AS total "
+            "FROM agent_runs ar "
+            "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
+            "LEFT JOIN agents a ON a.id = ar.agent_id "
+            "WHERE pr.project_id = ? "
+            "AND ar.started_at >= datetime('now', '-30 days') "
+            "GROUP BY a.role ORDER BY total DESC, runs DESC",
+            (pid,),
+        ).fetchall()
+        # Synthetic media roles: one per kind. Only emitted when total>0
+        # so the UI table doesn't get four empty rows for projects that
+        # never ran the video team.
+        media_role_rows = conn.execute(
+            "SELECT kind, COUNT(*) AS runs, "
+            "COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM media_assets "
+            "WHERE project_id = ? "
+            "AND created_at >= datetime('now', '-30 days') "
+            "GROUP BY kind",
+            (pid,),
+        ).fetchall()
+        # ---- by_phase[]: pipeline_runs.kind + synthetic 'media' / 'video' ----
+        by_phase_rows = conn.execute(
+            "SELECT pr.kind AS phase, COUNT(*) AS runs, "
+            "COALESCE(SUM(ar.cost_usd), 0) AS total "
+            "FROM agent_runs ar "
+            "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
+            "WHERE pr.project_id = ? "
+            "AND ar.started_at >= datetime('now', '-30 days') "
+            "GROUP BY pr.kind ORDER BY total DESC",
+            (pid,),
+        ).fetchall()
+        # Media is not linked to a pipeline_run, so we synthesise two
+        # phases out of media_assets.kind:
+        #   * 'media' = image / audio / subtitle (article pipeline output)
+        #   * 'video' = the video team's per-scene Wan i2v clips
+        # Both are aggregated to a single row each (counts include every
+        # asset row in the window; total in USD).
+        media_phase_rows = conn.execute(
+            "SELECT "
+            "  CASE WHEN kind = 'video' THEN 'video' ELSE 'media' END AS phase, "
+            "  COUNT(*) AS runs, "
+            "  COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM media_assets "
+            "WHERE project_id = ? "
+            "AND created_at >= datetime('now', '-30 days') "
+            "GROUP BY CASE WHEN kind = 'video' THEN 'video' ELSE 'media' END",
+            (pid,),
+        ).fetchall()
+        # ---- by_day[]: 14-day timeseries with zero-fill, oldest first ----
+        day_rows = conn.execute(
+            "SELECT date(ar.started_at) AS d, "
+            "COALESCE(SUM(ar.cost_usd), 0) AS total "
+            "FROM agent_runs ar "
+            "JOIN pipeline_runs pr ON pr.id = ar.pipeline_run_id "
+            "WHERE pr.project_id = ? "
+            "AND ar.started_at >= datetime('now', '-13 days') "
+            "GROUP BY date(ar.started_at)",
+            (pid,),
+        ).fetchall()
+        day_media_rows = conn.execute(
+            "SELECT date(created_at) AS d, "
+            "COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM media_assets "
+            "WHERE project_id = ? "
+            "AND created_at >= datetime('now', '-13 days') "
+            "GROUP BY date(created_at)",
+            (pid,),
+        ).fetchall()
+    # Merge by_role[]: append synthetic __media_{kind}__ rows.
+    by_role_out = [
+        {"role": r["role"], "runs": int(r["runs"]),
+         "total_usd": float(r["total"] or 0)}
+        for r in by_role_rows
+    ]
+    for r in media_role_rows:
+        total = float(r["total"] or 0)
+        if total <= 0:
+            continue
+        by_role_out.append({
+            "role": f"__media_{r['kind']}__",
+            "runs": int(r["runs"]),
+            "total_usd": total,
+        })
+    by_role_out.sort(key=lambda r: (-r["total_usd"], -r["runs"]))
+    # Merge by_phase[]: combine pipeline_runs.kind rows with synthetic
+    # 'media' / 'video' rows. If a phase already exists in by_phase_rows
+    # (e.g. 'video' phase from pipeline_runs.kind='video' with agent_runs
+    # cost on top of media), sum totals and runs into one row.
+    by_phase_map: dict[str, dict[str, Any]] = {}
+    for r in by_phase_rows:
+        phase = r["phase"] or "(unknown)"
+        by_phase_map[phase] = {
+            "phase": phase,
+            "runs": int(r["runs"]),
+            "total_usd": float(r["total"] or 0),
+        }
+    for r in media_phase_rows:
+        total = float(r["total"] or 0)
+        if total <= 0:
+            continue
+        phase = r["phase"]
+        if phase in by_phase_map:
+            by_phase_map[phase]["runs"] += int(r["runs"])
+            by_phase_map[phase]["total_usd"] += total
+        else:
+            by_phase_map[phase] = {
+                "phase": phase,
+                "runs": int(r["runs"]),
+                "total_usd": total,
+            }
+    by_phase_out = sorted(
+        by_phase_map.values(), key=lambda x: -x["total_usd"]
+    )
+    # by_day_map: sum agent_runs and media_assets per ISO date string.
+    by_day_map = {r["d"]: float(r["total"] or 0) for r in day_rows}
+    for r in day_media_rows:
+        d = r["d"]
+        by_day_map[d] = by_day_map.get(d, 0.0) + float(r["total"] or 0)
+    today_d = _date.today()
+    by_day = []
+    for i in range(14):
+        d = today_d - _td(days=13 - i)
+        ds = d.isoformat()
+        by_day.append({"date": ds, "total_usd": float(by_day_map.get(ds, 0))})
+    h.send_json(200, {
+        "today_usd": today,
+        "month_usd": month,
+        "budget_usd_month": float(project.get("budget_usd_month") or 0),
+        "by_role": by_role_out,
+        "by_phase": by_phase_out,
+        "by_day": by_day,
+    })
+
+
+@route("POST", "/api/posts/{post_id}/publish_now")
+def _publish_now(h: "AicrewHandler", p: dict[str, str]) -> None:
+    """Publish an existing scheduled post immediately, ignoring its slot.
+
+    Resets ``scheduled_for`` to now, zeros ``attempts`` (so the manual
+    click gets a fresh retry budget — useful when a post has hit
+    ``status='failed'`` after MAX_ATTEMPTS and the user wants to retry
+    after fixing whatever caused the failure), then synchronously
+    invokes the publisher.
+    """
+    post_id = p["post_id"]
+    with db.connect(h.settings.db_path) as conn:
+        row = conn.execute(
+            "SELECT id, status FROM posts WHERE id=?", (post_id,),
+        ).fetchone()
+        if not row:
+            h.send_json(404, {"error": "post not found"})
+            return
+        # Force the post into 'scheduled' state (it might be 'failed'
+        # after MAX_ATTEMPTS) and reset attempts so the manual click
+        # gets a fresh retry budget.
+        conn.execute(
+            "UPDATE posts SET status='scheduled', scheduled_for=?, "
+            "attempts=0, last_attempt_at=NULL, error=NULL WHERE id=?",
+            (now_utc_iso(), post_id),
+        )
+    ok = publish_one_post(post_id, h.settings)
+    h.send_json(200, {"ok": ok})
+
+
+@route("GET", "/api/projects/{pkey}/topics/{tid}")
+def _get_topic(h: "AicrewHandler", p: dict[str, str]) -> None:
+    """Topic detail page. Returns:
+        topic         — full topic row (incl. event_date, scores, sources)
+        articles      — articles already written from this topic (per language)
+        agent_runs    — agent runs that touched this topic specifically
+                        (researcher / research_validator / article_writer /
+                        headline_writer / qa_editorial / qa_visual /
+                        image_prompt_writer; their topic_id is set in
+                        executor.run() calls).
+        topic_phase_runs — runs from the SAME pipeline_run that produced
+                        the topic (topic_generator / topic_validator /
+                        topic_ranker). Their topic_id is NULL because
+                        they operate on batches, but their input/output
+                        contains this topic title in JSON. We surface them
+                        so the user can see what the search agents
+                        collected and how the ranker scored it.
+    """
+    project = _resolve_project(h, p["pkey"])
+    if project is None:
+        return
+    with db.connect(h.settings.db_path) as conn:
+        topic = conn.execute(
+            "SELECT * FROM topics WHERE id=? AND project_id=?",
+            (p["tid"], project["id"]),
+        ).fetchone()
+        if not topic:
+            h.send_json(404, {"error": "topic not found"})
+            return
+        topic = db.row_to_dict(topic)
+        articles = db.rows_to_list(conn.execute(
+            "SELECT id, language, status, chosen_headline, chosen_image_id, "
+            "qa_score, created_at, written_at "
+            "FROM articles WHERE topic_id=? ORDER BY language",
+            (topic["id"],),
+        ).fetchall())
+        # agent_runs scoped to this topic (per-topic agents).
+        runs = db.rows_to_list(conn.execute(
+            "SELECT ar.*, a.role AS agent_role, a.language AS agent_language, "
+            "a.display_name AS agent_display_name "
+            "FROM agent_runs ar LEFT JOIN agents a ON a.id=ar.agent_id "
+            "WHERE ar.topic_id=? ORDER BY ar.started_at",
+            (topic["id"],),
+        ).fetchall())
+        # Topic-phase runs come from the same pipeline_run that produced the
+        # topic. They have topic_id NULL but their inputs/outputs reference
+        # this topic by title in JSON.
+        phase_runs: list[dict[str, Any]] = []
+        if topic.get("pipeline_run_id"):
+            phase_runs = db.rows_to_list(conn.execute(
+                "SELECT ar.*, a.role AS agent_role, a.language AS agent_language, "
+                "a.display_name AS agent_display_name "
+                "FROM agent_runs ar LEFT JOIN agents a ON a.id=ar.agent_id "
+                "WHERE ar.pipeline_run_id=? AND ar.topic_id IS NULL "
+                "AND a.role IN ('topic_generator','topic_validator','topic_ranker') "
+                "ORDER BY ar.started_at",
+                (topic["pipeline_run_id"],),
+            ).fetchall())
+    h.send_json(200, {
+        "project": {"id": project["id"], "slug": project["slug"], "name": project["name"]},
+        "topic": topic,
+        "articles": articles,
+        "agent_runs": runs,
+        "topic_phase_runs": phase_runs,
+    })
+
+
 @route("GET", "/api/projects/{pkey}/articles/{aid}")
 def _get_article(h: "AicrewHandler", p: dict[str, str]) -> None:
     project = _resolve_project(h, p["pkey"])
@@ -444,8 +844,18 @@ def _get_article(h: "AicrewHandler", p: dict[str, str]) -> None:
             h.send_json(404, {"error": "article not found"})
             return
         article = db.row_to_dict(article)
+        # Media is generated ONCE per topic and stored in media_assets with
+        # FK pointing to the FIRST article of the topic (usually RU). All
+        # sibling articles of the same topic share the same chosen_image_id
+        # but have no rows of their own in media_assets — see
+        # PipelineRunner._generate_topic_image. So we look up media by
+        # topic, not by article_id, otherwise the EN article page renders
+        # an empty gallery even though the image is correctly attached.
         media = db.rows_to_list(conn.execute(
-            "SELECT * FROM media_assets WHERE article_id=?", (p["aid"],)
+            "SELECT * FROM media_assets "
+            "WHERE article_id IN (SELECT id FROM articles WHERE topic_id=?) "
+            "ORDER BY created_at",
+            (article["topic_id"],),
         ).fetchall())
         runs = db.rows_to_list(conn.execute(
             "SELECT * FROM agent_runs WHERE article_id=? ORDER BY started_at", (p["aid"],)
@@ -453,11 +863,215 @@ def _get_article(h: "AicrewHandler", p: dict[str, str]) -> None:
         topic = conn.execute(
             "SELECT * FROM topics WHERE id=?", (article["topic_id"],)
         ).fetchone()
+        # Channels of this project that match the article's language.
+        # The article page uses this to render a "publish to channel"
+        # panel — we only show channels with matching language because
+        # a Russian-only article has nothing useful to send to an
+        # English Telegram channel.
+        project_channels = db.rows_to_list(conn.execute(
+            "SELECT id, slug, kind, name, language, is_video, credentials_enc "
+            "FROM channels WHERE project_id=? AND is_enabled=1 AND language=? "
+            "ORDER BY name",
+            (project["id"], article["language"]),
+        ).fetchall())
+        # Existing posts for this article across all channels. UI uses
+        # this to show "уже опубликовано / запланировано / упало" inline
+        # next to each channel button instead of the bare "Опубликовать
+        # сейчас" CTA.
+        art_posts = db.rows_to_list(conn.execute(
+            "SELECT po.id, po.channel_id, po.status, po.scheduled_for, "
+            "po.published_at, po.external_url, po.error, po.attempts, "
+            "ch.name AS channel_name, ch.kind AS channel_kind, "
+            "ch.slug AS channel_slug "
+            "FROM posts po JOIN channels ch ON ch.id=po.channel_id "
+            "WHERE po.article_id=?",
+            (p["aid"],),
+        ).fetchall())
+    # Flag connected channels and strip the encrypted blob — same logic
+    # as _get_project, kept duplicated rather than factored out so the
+    # surface for accidental leaks of credentials_enc to the wire stays
+    # very small and grepable.
+    for ch in project_channels:
+        enc = (ch.pop("credentials_enc", "") or "").strip()
+        connected = False
+        if enc:
+            try:
+                raw = json.loads(decrypt(enc, h.settings.master_key))
+                connected = bool(raw) and any(
+                    str(v).strip() for v in raw.values() if v is not None
+                )
+            except Exception:
+                connected = False
+        ch["is_connected"] = connected
+    # Final video lookup: by product decision, the only kind='video' row
+    # with chosen=1 is the assembled, final clip. Per-scene clips have
+    # chosen=0 (see PipelineRunner.run_video_phase). If nothing matches,
+    # the article hasn't been turned into a video yet and we return null.
+    video_payload: dict[str, Any] | None = None
+    with db.connect(h.settings.db_path) as conn:
+        vrow = conn.execute(
+            "SELECT * FROM media_assets WHERE article_id=? AND kind='video' "
+            "AND chosen=1 ORDER BY created_at DESC LIMIT 1",
+            (p["aid"],),
+        ).fetchone()
+    if vrow is not None:
+        v = db.row_to_dict(vrow) or {}
+        meta = db.jload(v.get("meta"), {}) or {}
+        video_payload = {
+            "url": v.get("storage_url"),
+            "duration_s": v.get("duration_s") or 0,
+            "scenes_count": int(meta.get("scenes_count") or 0),
+            "created_at": v.get("created_at"),
+        }
     h.send_json(200, {
         "project": {"id": project["id"], "slug": project["slug"], "name": project["name"]},
         "article": article, "media": media, "agent_runs": runs,
         "topic": db.row_to_dict(topic),
+        "channels": project_channels, "posts": art_posts,
+        "video": video_payload,
     })
+
+
+@route("POST", "/api/projects/{pkey}/articles/{aid}/generate_video")
+def _generate_video(h: "AicrewHandler", p: dict[str, str]) -> None:
+    """Synchronously run the video phase for one article and return the
+    final MP4 URL. In mock mode this writes ~12 placeholder media files
+    in <media_dir>; in real mode it would talk to 302.ai / OpenAI / ffmpeg.
+    """
+    project = _resolve_project(h, p["pkey"])
+    if project is None:
+        return
+    aid = p["aid"]
+    with db.connect(h.settings.db_path) as conn:
+        row = conn.execute(
+            "SELECT id, project_id FROM articles WHERE id=? AND project_id=?",
+            (aid, project["id"]),
+        ).fetchone()
+    if row is None:
+        h.send_json(404, {"error": "article not found"})
+        return
+    runner = PipelineRunner(h.settings)
+    try:
+        result = runner.run_video_phase(aid)
+    except Exception as exc:
+        log.exception("run_video_phase failed for article=%s", aid)
+        h.send_json(500, {"error": repr(exc)})
+        return
+    h.send_json(200, {
+        "final_video_url": result["final_video_url"],
+        "duration_s": result["duration_s"],
+        "scenes_count": result["scenes_count"],
+        "media_asset_id": result["media_asset_id"],
+    })
+
+
+@route("POST", "/api/projects/{pkey}/articles/{aid}/publish/{ckey}")
+def _publish_article_to_channel(h: "AicrewHandler", p: dict[str, str]) -> None:
+    """One-click "publish this article to this channel right now".
+
+    Used from the article detail page where the user sees a list of
+    connected channels and clicks "Опубликовать в Telegram". The flow:
+
+      1. Resolve project + channel + article, ensure the channel has
+         real credentials (avoids creating a post that will instantly
+         fail on the first tick).
+      2. Find or create the (article, channel) post. If new, run the
+         channel rewriter once so ``posts.body`` holds the
+         channel-adapted text — same path the slot-aware scheduler
+         takes, just compressed into one synchronous call.
+      3. Force ``scheduled_for=now`` and synchronously fire
+         publish_one_post.
+
+    Idempotent: a second click won't create a duplicate post (UNIQUE
+    constraint on (article_id, channel_id)) — it just resets the row
+    and retries, which is exactly what the user expects when the first
+    attempt failed.
+    """
+    project = _resolve_project(h, p["pkey"])
+    if project is None:
+        return
+    channel = _resolve_channel(h, project["id"], p["ckey"])
+    if channel is None:
+        return
+    # Verify the channel actually has credentials. Same is_connected
+    # check as _get_project / _get_article — see those for rationale
+    # (seed.py writes encrypted empty dicts for fresh channels).
+    enc = (channel.get("credentials_enc") or "").strip()
+    is_connected = False
+    if enc:
+        try:
+            raw = json.loads(decrypt(enc, h.settings.master_key))
+            is_connected = bool(raw) and any(
+                str(v).strip() for v in raw.values() if v is not None
+            )
+        except Exception:
+            is_connected = False
+    if not is_connected:
+        h.send_json(400, {"error": "channel is not connected (no credentials)"})
+        return
+    with db.connect(h.settings.db_path) as conn:
+        article_row = conn.execute(
+            "SELECT * FROM articles WHERE id=? AND project_id=?",
+            (p["aid"], project["id"]),
+        ).fetchone()
+        if not article_row:
+            h.send_json(404, {"error": "article not found"})
+            return
+        article = db.row_to_dict(article_row)
+        existing_post = conn.execute(
+            "SELECT id FROM posts WHERE article_id=? AND channel_id=?",
+            (p["aid"], channel["id"]),
+        ).fetchone()
+    runner = PipelineRunner(h.settings)
+    spec = CHANNEL_KINDS[channel["kind"]]
+    if existing_post:
+        post_id = existing_post["id"]
+        # Reset the existing post so the user can re-publish (e.g. if
+        # the previous attempt failed). We do NOT re-run the rewriter
+        # here on the assumption the existing body is good; if the user
+        # wants a fresh rewrite they can delete the post first.
+        with db.connect(h.settings.db_path) as conn:
+            conn.execute(
+                "UPDATE posts SET status='scheduled', scheduled_for=?, "
+                "attempts=0, last_attempt_at=NULL, error=NULL WHERE id=?",
+                (now_utc_iso(), post_id),
+            )
+    else:
+        # Fresh post: run the channel rewriter so body is adapted to
+        # the channel format (Telegram tone is different from VK tone,
+        # and definitely different from a tweet's char limit).
+        with db.connect(h.settings.db_path) as conn:
+            agents: dict[tuple[str, str], dict[str, Any]] = {}
+            for r in conn.execute(
+                "SELECT * FROM agents WHERE project_id=? AND is_enabled=1",
+                (project["id"],),
+            ).fetchall():
+                d = db.row_to_dict(r) or {}
+                agents[(d["role"], d.get("language") or "bi")] = d
+        prid = runner.create_pipeline_run(project["id"], kind="publication")
+        if spec.is_video:
+            # Video channels don't have a text rewriter today — just
+            # carry the headline. Real video rendering is a separate
+            # feature (see docs/07-video-team.md).
+            body, headline, image_id = "", article["chosen_headline"], None
+        else:
+            body, headline, image_id = runner._rewrite_for_channel(
+                prid, agents, channel, spec, article)
+        post_id = db.new_id("po_")
+        with db.connect(h.settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO posts (id, article_id, channel_id, body, headline, "
+                "image_asset_id, status, scheduled_for, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (post_id, p["aid"], channel["id"], body, headline, image_id,
+                 "scheduled", now_utc_iso(), db.now_iso()),
+            )
+            conn.execute(
+                "UPDATE pipeline_runs SET status='completed', finished_at=? WHERE id=?",
+                (db.now_iso(), prid),
+            )
+    ok = publish_one_post(post_id, h.settings)
+    h.send_json(200, {"ok": ok, "post_id": post_id})
 
 
 # --------------------------------------------------------------- handler ---
@@ -574,12 +1188,130 @@ class AicrewHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _ensure_enabled_teams(settings: Settings) -> None:
+    """Backfill ``projects.enabled_teams`` for older projects.
+
+    The DB-level migration in ``db.init_schema`` already runs an
+    ``UPDATE … WHERE enabled_teams IS NULL OR enabled_teams = ''`` once
+    per server start, so this function is largely defensive — it covers
+    the corner case where a project was created via raw SQL or an older
+    seed that didn't write the column. Walks every project, parses
+    ``language_modes``, computes the default team set, and writes it
+    only when the row is still empty. Idempotent.
+    """
+    with db.connect(settings.db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, language_modes FROM projects "
+            "WHERE enabled_teams IS NULL OR enabled_teams = ''"
+        ).fetchall()
+        for row in rows:
+            try:
+                langs = json.loads(row["language_modes"] or '["ru"]')
+                if not isinstance(langs, list) or not langs:
+                    langs = ["ru"]
+            except json.JSONDecodeError:
+                langs = ["ru"]
+            teams = default_enabled_teams(langs)
+            conn.execute(
+                "UPDATE projects SET enabled_teams=? WHERE id=?",
+                (json.dumps(teams), row["id"]),
+            )
+            log.info("enabled_teams: backfilled for project %s = %s",
+                     row["id"], teams)
+
+
+def _ensure_default_agents_for_existing_projects(settings: Settings) -> None:
+    """Add missing default agents to existing projects after a code upgrade.
+
+    Walks every project in the DB and compares its current
+    ``(role, language)`` agent set against the expected set from
+    ``default_agents_for_project(language_modes)``. Inserts only the missing
+    ones with their registry defaults; never modifies or deletes existing
+    rows. This is what lets a user run ``git pull && systemctl restart``
+    and pick up new roles (e.g. the video team) automatically.
+
+    Called from ``serve()``. Idempotent — re-running adds nothing once the
+    project is up to date.
+    """
+    with db.connect(settings.db_path) as conn:
+        projects = db.rows_to_list(conn.execute(
+            "SELECT id, name, language_modes FROM projects"
+        ).fetchall())
+    for proj in projects:
+        try:
+            languages = json.loads(proj.get("language_modes") or '["ru"]')
+            if not isinstance(languages, list) or not languages:
+                languages = ["ru"]
+        except json.JSONDecodeError:
+            languages = ["ru"]
+        with db.connect(settings.db_path) as conn:
+            existing_rows = conn.execute(
+                "SELECT role, language FROM agents WHERE project_id=?",
+                (proj["id"],),
+            ).fetchall()
+            existing = {(r["role"], r["language"] or "bi") for r in existing_rows}
+            added = 0
+            for entry in default_agents_for_project(languages):
+                key = (entry["role"], entry["language"])
+                if key in existing:
+                    continue
+                spec = entry["spec"]
+                base_slug = entry["role"].replace("_", "-")
+                if entry["language"] in ("ru", "en"):
+                    base_slug += "-" + entry["language"]
+                slug = db.unique_slug(
+                    conn, "agents", base_slug,
+                    scope_col="project_id", scope_val=proj["id"],
+                )
+                conn.execute(
+                    "INSERT INTO agents (id, project_id, slug, role, "
+                    "display_name, description, model, temperature, max_tokens, "
+                    "top_p, prompt_template, params, tools_enabled, language, "
+                    "is_enabled, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        db.new_id("ag_"), proj["id"], slug, entry["role"],
+                        entry["display_name"], spec.description,
+                        spec.default_model, spec.default_temperature,
+                        spec.default_max_tokens, 1.0, spec.prompt_template,
+                        json.dumps(spec.default_params),
+                        json.dumps(list(spec.tools)),
+                        entry["language"], 1, db.now_iso(), db.now_iso(),
+                    ),
+                )
+                added += 1
+        if added:
+            log.info("ensuring video team for project %s: added %d new agents",
+                     proj["id"], added)
+
+
 def serve(settings: Settings | None = None) -> None:
     settings = settings or load_settings()
     AicrewHandler.settings = settings
+    # Critical: ensure schema is up to date before the scheduler thread
+    # starts touching `posts`. The scheduler reads attempts/last_attempt_at,
+    # which are added by soft-migration in init_schema; without this call
+    # an old DB created before the scheduler existed would crash the very
+    # first tick. Cheap to call when the schema is already current.
+    db.init_schema(settings.db_path)
+    # Soft-migrate enabled_teams for projects created before the column
+    # existed. Cheap (one query per stale row) and idempotent.
+    _ensure_enabled_teams(settings)
+    # Soft-migrate agents: existing projects need to pick up new roles
+    # introduced by `git pull` (e.g. the video team — video_keyframe_artist,
+    # voice_director, subtitle_styler, video_assembler) without forcing
+    # the user to re-seed and lose their data. We only INSERT missing rows;
+    # existing agents are never touched.
+    _ensure_default_agents_for_existing_projects(settings)
     server = ThreadingHTTPServer(("0.0.0.0", settings.port), AicrewHandler)
     log.warning("serving on http://0.0.0.0:%d (db=%s, llm=%s)",
                 settings.port, settings.db_path, settings.llm_provider)
+    # Background publication scheduler. Daemon thread, idempotent across
+    # double-calls, ticks every TICK_SECONDS picking due posts and
+    # publishing them through the channel adapter. Started here (not at
+    # module import) so unit tests that import api.py do not spin up a
+    # background thread that would race with their tearDown.
+    start_scheduler(settings)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

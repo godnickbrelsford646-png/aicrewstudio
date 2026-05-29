@@ -11,20 +11,26 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from . import db
 from .agents.executor import AgentExecutor
-from .agents.registry import LANG_SCOPED_ROLES
+from .agents.registry import LANG_SCOPED_ROLES, default_enabled_teams
 from .channels.registry import CHANNEL_KINDS
 from .crypto import decrypt
 from .llm.adapter import get_adapter
 from .logging_setup import set_pipeline_run
 from .publishers import get_publisher
+from .scheduler import next_slot_utc, _utc_iso, publish_due_posts
 from .settings import Settings
 from .tools.image_gen import generate_image
+from .tools.tts_gen import generate_tts
+from .tools.video_assembler import assemble_video
+from .tools.video_gen import generate_video_clip
+from .tools.whisper_transcribe import transcribe_audio
 
 log = logging.getLogger("aicrew.pipeline")
 
@@ -42,6 +48,33 @@ class PipelineSummary:
 
 def _topic_fingerprint(title: str) -> str:
     return hashlib.sha1(title.lower().strip().encode("utf-8")).hexdigest()
+
+
+def _enabled_teams_of(project: dict[str, Any]) -> set[str]:
+    """Parse ``project.enabled_teams`` JSON column into a set.
+
+    Falls back to "all teams enabled" when the column is missing or empty,
+    so legacy projects upgraded in place keep working until the API
+    backfills them via ``_ensure_enabled_teams``. The legacy fallback uses
+    the project's ``language_modes`` so a Russian-only project gets only
+    text_ru/video_ru, not the full default.
+    """
+    raw = project.get("enabled_teams")
+    if not raw:
+        try:
+            langs = json.loads(project.get("language_modes") or '["ru"]')
+        except (json.JSONDecodeError, TypeError):
+            langs = ["ru"]
+        return set(default_enabled_teams(langs))
+    if isinstance(raw, list):
+        return set(raw)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return set(parsed)
+        return set()
+    except (json.JSONDecodeError, TypeError):
+        return set()
 
 
 def _agents_by_role(conn, project_id: str) -> dict[tuple[str, str], dict[str, Any]]:
@@ -90,7 +123,13 @@ class PipelineRunner:
         val_runtime = dict(val)
         val_runtime["params"] = json.dumps(val_params)
 
-        max_retries = max(int(val_params.get("max_retries", 5) or 5), 5)
+        # Cap max_retries at a sane value. Each retry costs one generator
+        # call + one batch validator call (and possibly one fresh Tavily
+        # query if the day's cache is cold), so 3 is plenty: with 8
+        # candidates per generator pass and ~70% pass-rate, 3 retries
+        # comfortably hit a target of 8 confirmed topics. Going higher
+        # explodes the bill for marginal gain.
+        max_retries = max(1, int(val_params.get("max_retries", 3) or 3))
         # Honor topic_generator.memory_lookback_days. Default 30 days if the
         # agent param is missing (e.g. for older DBs). Topics produced within
         # this window — at any non-rejected status — are added to
@@ -103,26 +142,48 @@ class PipelineRunner:
 
         log.info("topic phase: project=%s target=%d max_retries=%d", project_id, target, max_retries)
         for attempt in range(max_retries):
+            # Each retry feeds the already-confirmed titles back into
+            # forbidden_topics so the generator does not re-propose them;
+            # we keep going until either the target is reached or we run
+            # out of retries. Under-shooting the target is an acceptable
+            # outcome (per product decision).
             gen_out = self.executor.run(
                 agent=gen, pipeline_run_id=prid,
-                inputs={"project": project, "forbidden_topics": forbidden + [c["title"] for c in confirmed]},
+                inputs={"project": project,
+                        "forbidden_topics": forbidden + [c["title"] for c in confirmed]},
             ).output
             cands = gen_out.get("topics", [])
+            if not cands:
+                continue
+            # Batch validation: ONE validator call for the whole pack of
+            # candidates. The validator's search_query_template renders
+            # to a generic "events on {{ today_md }} in history" query
+            # (same template as the generator's) so the 24h Tavily cache
+            # makes this a free second hit when the generator already ran.
+            # The validator prompt iterates over candidate_topics and for
+            # each one applies the WEB SEARCH RESULTS source-of-truth gate
+            # (no source = is_valid=false). This is ~N× cheaper than the
+            # per-candidate loop we used to run, while keeping the same
+            # anti-hallucination guarantees because the prompt itself
+            # demands per-candidate verification against the search block.
             val_out = self.executor.run(
                 agent=val_runtime, pipeline_run_id=prid,
                 inputs={"candidate_topics": cands},
             ).output
+            existing_titles = {c["title"] for c in confirmed}
             for v in val_out.get("validated", []):
-                if v.get("is_valid") and v["title"] not in [c["title"] for c in confirmed]:
+                if v.get("is_valid") and v.get("title") not in existing_titles:
                     confirmed.append(v)
+                    existing_titles.add(v["title"])
             log.info("topic phase: attempt %d/%d -> confirmed=%d / target=%d",
                      attempt + 1, max_retries, len(confirmed), target)
             if len(confirmed) >= target:
                 break
 
         if len(confirmed) < target:
-            log.warning("topic phase: stopped with %d confirmed of %d target after %d attempts",
-                        len(confirmed), target, max_retries)
+            log.info("topic phase: stopped with %d confirmed of %d target after %d attempts "
+                     "(under-shooting is acceptable)",
+                     len(confirmed), target, max_retries)
 
         rank_out = self.executor.run(
             agent=ranker, pipeline_run_id=prid,
@@ -170,8 +231,8 @@ class PipelineRunner:
                 rank = scored_by_title.get(title) or {}
                 conn.execute(
                     "INSERT INTO topics (id, project_id, pipeline_run_id, title, summary, sources, "
-                    "status, score_total, scores, fingerprint, created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "status, score_total, scores, fingerprint, event_date, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         db.new_id("tp_"), project_id, prid, title,
                         v.get("summary_extended", ""),
@@ -179,7 +240,15 @@ class PipelineRunner:
                         "ranked",
                         float(rank.get("score_total", 0)),
                         db.jdump(rank.get("scores", {})),
-                        fp, db.now_iso(),
+                        fp,
+                        # event_date is the exact date of the historical
+                        # event (e.g. "19 мая 1536"). It comes from the
+                        # topic_validator and is the anchor that all
+                        # downstream agents (researcher, writer, headline,
+                        # qa) re-mention so the article keeps the date in
+                        # the body and never silently drifts to "today".
+                        (v.get("event_date") or "").strip(),
+                        db.now_iso(),
                     ),
                 )
             conn.execute(
@@ -204,7 +273,24 @@ class PipelineRunner:
             ).fetchall()
             top_topics = db.rows_to_list(top_topics)
 
+        # Filter languages by enabled text teams. If the user disabled
+        # text_ru in Settings, articles in Russian are not produced even
+        # though the project still lists "ru" in language_modes — the
+        # rationale is that language_modes is a static project capability
+        # while enabled_teams is a runtime toggle the user can flip on/off
+        # without re-creating agents.
+        enabled = _enabled_teams_of(project)
+        languages = [l for l in languages if f"text_{l}" in enabled]
         prid = pipeline_run_id or self._start_pipeline_run(project_id, "articles")
+        if not languages:
+            log.info("article phase: all text teams disabled, nothing to do")
+            with db.connect(self.settings.db_path) as conn:
+                conn.execute(
+                    "UPDATE pipeline_runs SET status=?, finished_at=? WHERE id=?",
+                    ("completed", db.now_iso(), prid),
+                )
+            return []
+
         article_ids: list[str] = []
         for topic in top_topics:
             # Step 1: write article TEXT for each language (no images yet).
@@ -232,7 +318,57 @@ class PipelineRunner:
                 "UPDATE pipeline_runs SET status=?, finished_at=? WHERE id=?",
                 ("completed", db.now_iso(), prid),
             )
+        # Safety net: ensure every article in this run shares a chosen_image_id
+        # with at least one sibling article of the same topic. Protects against:
+        #   * old DBs where _generate_topic_image was per-article and only the
+        #     first language got an image;
+        #   * topics where image generation had a transient error in some
+        #     branches but succeeded in another.
+        # Only NULL chosen_image_id rows are touched; existing assignments are
+        # preserved.
+        self._propagate_topic_images(article_ids)
         return article_ids
+
+    def _propagate_topic_images(self, article_ids: list[str]) -> None:
+        """For each topic touched in this article phase, if any of its articles
+        already has chosen_image_id, copy that id to every sibling article of
+        the same topic that still has chosen_image_id NULL.
+
+        Runs in a single SQLite transaction so it is cheap even with many
+        articles and is safe to re-run.
+        """
+        if not article_ids:
+            return
+        with db.connect(self.settings.db_path) as conn:
+            # Distinct topic_ids touched in this run.
+            placeholders = ",".join("?" for _ in article_ids)
+            topic_ids = [
+                r["topic_id"] for r in conn.execute(
+                    f"SELECT DISTINCT topic_id FROM articles WHERE id IN ({placeholders})",
+                    article_ids,
+                ).fetchall() if r["topic_id"]
+            ]
+            for tid in topic_ids:
+                row = conn.execute(
+                    "SELECT chosen_image_id FROM articles "
+                    "WHERE topic_id=? AND chosen_image_id IS NOT NULL "
+                    "AND chosen_image_id <> '' LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if not row:
+                    log.warning("topic %s: no image attached to any article "
+                                "after article phase (image gen likely failed "
+                                "for all languages)", tid)
+                    continue
+                cur = conn.execute(
+                    "UPDATE articles SET chosen_image_id=? "
+                    "WHERE topic_id=? AND (chosen_image_id IS NULL OR chosen_image_id='')",
+                    (row["chosen_image_id"], tid),
+                )
+                if cur.rowcount:
+                    log.info("topic %s: propagated chosen_image_id to %d "
+                             "previously-unlinked article(s)",
+                             tid, cur.rowcount)
 
     def _write_article_text(self, project: dict[str, Any],
                              agents: dict[tuple[str, str], dict[str, Any]],
@@ -253,6 +389,15 @@ class PipelineRunner:
             "title": topic["title"],
             "summary_extended": topic.get("summary", ""),
             "sources": json.loads(topic.get("sources") or "[]"),
+            # event_date — exact date of the historical event, e.g.
+            # "19 мая 1536". Persisted on the topic by the topic phase
+            # from the topic_validator output. ALL downstream agents
+            # (researcher, research_validator, article_writer,
+            # headline_writer, qa_editorial, image_prompt_writer) read
+            # this so the article keeps the date in the body and never
+            # silently drifts to "today". Empty string for projects
+            # that don't use date anchoring.
+            "event_date": (topic.get("event_date") or "").strip(),
         }
         researcher = agents.get(("researcher", lang))
         if not researcher:
@@ -273,10 +418,37 @@ class PipelineRunner:
             inputs={"topic": topic_inputs, "research_validated": brief, "language": lang,
                     "project": project},
         ).output
+        # Fact-audit BEFORE headline_writer/qa_editorial. fact_audit walks
+        # article.body_md, extracts every concrete claim (names, numbers,
+        # quotes, dates) and verifies it against research_validated. If a
+        # claim has no support in the brief, it is removed/rephrased into
+        # `fixed_body_md`. We use the cleaned body as input to the rest of
+        # the chain (headlines, qa_editorial), so any fabricated names or
+        # quotes never reach published posts.
+        # Falls back gracefully if no fact_audit agent is present (e.g.
+        # an old DB pre-migration) — we just skip the step and leave
+        # article_out untouched.
+        fa_agent = agents.get(("fact_audit", lang))
+        fa_out: dict[str, Any] = {}
+        if fa_agent:
+            fa_out = self.executor.run(
+                agent=fa_agent, pipeline_run_id=prid, topic_id=topic["id"],
+                inputs={"article": article_out, "research_validated": brief,
+                        "topic": topic_inputs, "language": lang},
+            ).output
+            fixed_body = fa_out.get("fixed_body_md")
+            if fixed_body:
+                article_out["body_md"] = fixed_body
+            unsupported = fa_out.get("unsupported_claims") or []
+            log.info("topic %s [%s]: fact_audit score=%s must_fix=%s "
+                     "unsupported_claims=%d",
+                     topic["id"], lang,
+                     fa_out.get("score"), fa_out.get("must_fix"),
+                     len(unsupported))
         headline_writer = agents.get(("headline_writer", lang))
         headlines_out = self.executor.run(
             agent=headline_writer, pipeline_run_id=prid, topic_id=topic["id"],
-            inputs={"article": article_out, "language": lang},
+            inputs={"article": article_out, "topic": topic_inputs, "language": lang},
         ).output
         article_id = db.new_id("ar_")
         with db.connect(self.settings.db_path) as conn:
@@ -292,12 +464,29 @@ class PipelineRunner:
                 ),
             )
         # QA editorial (text-only check + headline pick + minimal edits).
+        # We pass research_validated so the new checklist item #0 (the
+        # factcheck pass) can verify that no name/number/quote in the
+        # body sneaks past fact_audit. Even though fact_audit already
+        # ran, qa_editorial provides a literary-second-pair-of-eyes
+        # check that occasionally catches edge cases.
         qa_ed = agents.get(("qa_editorial", lang))
         qa_out = self.executor.run(
             agent=qa_ed, pipeline_run_id=prid, article_id=article_id,
             inputs={"article": article_out, "headlines": headlines_out.get("headlines", []),
-                    "language": lang},
+                    "topic": topic_inputs, "language": lang,
+                    "research_validated": brief},
         ).output
+        # Combined QA notes: persist fact_audit findings alongside the
+        # editorial issues so the UI / audit trail can see both.
+        combined_notes: dict[str, Any] = {
+            "issues": qa_out.get("issues", []),
+        }
+        if fa_out:
+            combined_notes["fact_audit"] = {
+                "score": fa_out.get("score"),
+                "must_fix": fa_out.get("must_fix"),
+                "unsupported_claims": fa_out.get("unsupported_claims", []),
+            }
         with db.connect(self.settings.db_path) as conn:
             conn.execute(
                 "UPDATE articles SET chosen_headline=?, body_full=?, "
@@ -306,7 +495,7 @@ class PipelineRunner:
                     qa_out.get("chosen_headline"),
                     qa_out.get("revised_body_md") or article_out.get("body_md", ""),
                     int(qa_out.get("score", 0)),
-                    db.jdump(qa_out.get("issues", [])),
+                    db.jdump(combined_notes),
                     db.now_iso(), article_id,
                 ),
             )
@@ -330,6 +519,14 @@ class PipelineRunner:
         articles.chosen_image_id row of this topic.
         """
         first_article_id, first_lang, first_article_out = written[0]
+        # Build a topic_inputs dict identical to what _write_article_text
+        # passes to per-language agents, so image agents get event_date.
+        topic_inputs = {
+            "title": topic["title"],
+            "summary_extended": topic.get("summary", ""),
+            "sources": json.loads(topic.get("sources") or "[]"),
+            "event_date": (topic.get("event_date") or "").strip(),
+        }
         # image_prompt_writer is GLOBAL_ROLES (language-neutral) — one
         # instance per project, language='bi'. Falls back to the per-language
         # variant for older DBs that still have language='ru'/'en' rows.
@@ -341,7 +538,8 @@ class PipelineRunner:
             return
         prompts_out = self.executor.run(
             agent=ipw, pipeline_run_id=prid, topic_id=topic["id"],
-            inputs={"article": first_article_out, "language": first_lang},
+            inputs={"article": first_article_out, "topic": topic_inputs,
+                    "language": first_lang},
         ).output
         ipw_params = json.loads(ipw["params"]) if isinstance(ipw["params"], str) else (ipw["params"] or {})
         image_model = ipw_params.get("image_model", "mock:placeholder") or "mock:placeholder"
@@ -353,8 +551,8 @@ class PipelineRunner:
             with db.connect(self.settings.db_path) as conn:
                 conn.execute(
                     "INSERT INTO media_assets (id, article_id, project_id, kind, language, prompt, "
-                    "model, storage_url, mime, width, height, chosen, meta, created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "model, storage_url, mime, width, height, chosen, cost_usd, meta, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         asset_id, first_article_id, project["id"], "image",
                         # language='multi' to signal that this asset is shared
@@ -363,6 +561,7 @@ class PipelineRunner:
                         "multi",
                         p["prompt"],
                         res.model, res.storage_url, res.mime, res.width, res.height, 0,
+                        float(res.cost_usd or 0.0),
                         db.jdump({"index": i, "negative": p.get("negative"),
                                    "topic_id": topic["id"]}),
                         db.now_iso(),
@@ -382,7 +581,7 @@ class PipelineRunner:
             visual_out = self.executor.run(
                 agent=qa_vi, pipeline_run_id=prid, article_id=first_article_id,
                 inputs={"article": first_article_out, "image_options": media_assets,
-                        "language": first_lang},
+                        "topic": topic_inputs, "language": first_lang},
             ).output
             chosen_idx = max(0, min(len(media_assets) - 1, int(visual_out.get("chosen_index", 0))))
         chosen_image_id = media_assets[chosen_idx]["id"]
@@ -394,51 +593,114 @@ class PipelineRunner:
                     "UPDATE articles SET chosen_image_id=? WHERE id=?",
                     (chosen_image_id, article_id),
                 )
+        log.info(
+            "topic %s: image attached to %d article(s) (lang=%s); chosen_image_id=%s",
+            topic["id"], len(written),
+            ",".join(lang for _, lang, _ in written),
+            chosen_image_id,
+        )
 
     # ---------------- publication phase ----------------------------------
 
-    def run_publication_phase(self, project_id: str, *, dry_run: bool = False) -> dict[str, int]:
-        """For every (article, channel) pair create a Post and publish via adapter.
+    def run_publication_phase(self, project_id: str, *,
+                              dry_run: bool = False,
+                              publish_immediately: bool = False
+                              ) -> dict[str, int]:
+        """Plan upcoming publications and enqueue them with ``scheduled_for``.
 
-        In production this is split: a scheduler enqueues posts for their slots.
-        Here we synchronously publish so the demo shows results in one shot.
+        This is the slot-aware replacement for the old "publish now"
+        flow. For each active text channel of the project we:
+
+          1. Look up ``channel_slots`` (enabled rows). Each slot is an
+             "HH:MM" in ``project.timezone`` — convert to the next
+             future UTC moment using zoneinfo. If the channel has no
+             slots, fall back to ``posts_per_day`` evenly distributed
+             over the day so old projects don't break.
+
+          2. Pick articles by ``selection_strategy`` (``by_rank`` or
+             ``random_among_written``), excluding any (article, channel)
+             pair already in ``posts`` (UNIQUE constraint guards us
+             too, but checking up front avoids wasting LLM calls on
+             the rewriter).
+
+          3. For each (article, slot) pair, run the channel rewriter
+             (so the per-channel body is ready to publish) and INSERT
+             a ``posts`` row with ``status='scheduled'`` and
+             ``scheduled_for``. The background scheduler thread will
+             pick the row up at the appointed moment.
+
+        ``publish_immediately=True`` skips the slot calculation, sets
+        ``scheduled_for=now``, and synchronously runs one tick of
+        ``publish_due_posts`` so the user sees results in one shot.
+        Useful for the "Полный цикл (опубликовать сейчас)" smoke-test
+        button. Default is False — proper scheduled mode.
+
+        ``dry_run=True`` plans the posts (creates ``status='scheduled'``
+        rows) but does not run a synchronous publish tick. Same as the
+        default mode, kept for backward compat.
         """
-
         with db.connect(self.settings.db_path) as conn:
+            project_row = conn.execute(
+                "SELECT timezone FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            tz_name = (project_row["timezone"] if project_row else "UTC") or "UTC"
+            project_full = _project(conn, project_id)
             channels = db.rows_to_list(conn.execute(
-                "SELECT * FROM channels WHERE project_id=? AND is_enabled=1", (project_id,)
+                "SELECT * FROM channels WHERE project_id=? AND is_enabled=1",
+                (project_id,),
             ).fetchall())
             articles = db.rows_to_list(conn.execute(
                 "SELECT * FROM articles WHERE project_id=? AND status='qa_passed' "
                 "ORDER BY written_at DESC", (project_id,)
             ).fetchall())
             agents = _agents_by_role(conn, project_id)
+        # Filter channels: only those whose language has the matching text
+        # team enabled. If text_en is off, English channels are silently
+        # skipped — the user can still see them in the UI, but new
+        # articles won't be queued for them on this run.
+        enabled = _enabled_teams_of(project_full)
+        before_filter = len(channels)
+        channels = [c for c in channels
+                    if f"text_{c['language']}" in enabled]
+        if len(channels) != before_filter:
+            log.info("publication phase: filtered %d channels by "
+                     "enabled_teams (kept %d of %d)",
+                     before_filter - len(channels), len(channels),
+                     before_filter)
         prid = self._start_pipeline_run(project_id, "publication")
         posts_created = 0
-        posts_published = 0
         for ch in channels:
             spec = CHANNEL_KINDS[ch["kind"]]
             lang_articles = [a for a in articles if a["language"] == ch["language"]]
             if not lang_articles:
                 continue
-            # respect daily budget per channel: posts_per_day caps how many we publish now
-            cap = max(1, int(ch["posts_per_day"]))
-            # selection strategy
+            slot_times = self._upcoming_slots_utc(
+                ch["id"], tz_name,
+                fallback_count=max(1, int(ch["posts_per_day"])),
+                publish_immediately=publish_immediately,
+            )
+            if not slot_times:
+                continue
+            # selection strategy: order articles, then take as many as
+            # we have slots, skipping ones already posted to this channel.
             if ch["selection_strategy"] == "random_among_written":
                 pool = sorted(lang_articles, key=lambda a: a["id"])
             else:
-                # by_rank requires topic score; use a join-like approach
                 with db.connect(self.settings.db_path) as conn:
                     scored = []
                     for a in lang_articles:
-                        t = conn.execute("SELECT score_total FROM topics WHERE id=?",
-                                         (a["topic_id"],)).fetchone()
+                        t = conn.execute(
+                            "SELECT score_total FROM topics WHERE id=?",
+                            (a["topic_id"],),
+                        ).fetchone()
                         scored.append((float(t["score_total"]) if t else 0.0, a))
-                pool = [a for _, a in sorted(scored, key=lambda x: x[0], reverse=True)]
-            # exclude articles already posted to this channel
-            taken = 0
+                pool = [a for _, a in sorted(scored, key=lambda x: x[0],
+                                              reverse=True)]
+            slot_iter = iter(slot_times)
             for a in pool:
-                if taken >= cap:
+                try:
+                    slot_dt = next(slot_iter)
+                except StopIteration:
                     break
                 with db.connect(self.settings.db_path) as conn:
                     exists = conn.execute(
@@ -446,96 +708,454 @@ class PipelineRunner:
                         (a["id"], ch["id"]),
                     ).fetchone()
                 if exists:
+                    # Article already queued/published for this channel;
+                    # we still consumed a slot iteration step? No — we
+                    # didn't, we just skip this article and try the
+                    # next one for the same slot. Push the slot back.
+                    slot_iter = iter([slot_dt, *slot_iter])  # type: ignore[arg-type]
                     continue
                 if spec.is_video:
-                    # video pipeline not yet generating final video assets; skip in MVP
                     body = ""
                     headline = a["chosen_headline"]
                     image_id = None
                 else:
-                    rewriter_inputs = {
-                        "article": {
-                            "body_md": a["body_full"],
-                            "title_working": a["chosen_headline"] or "",
-                        },
-                        "channel": {
-                            "name": ch["name"], "kind": ch["kind"],
-                            "max_chars": spec.max_chars,
-                        },
-                        "language": ch["language"],
-                    }
-                    rewriter_agent = None
-                    if ch.get("rewriter_agent_id"):
-                        with db.connect(self.settings.db_path) as conn:
-                            row = conn.execute(
-                                "SELECT * FROM agents WHERE id=?",
-                                (ch["rewriter_agent_id"],),
-                            ).fetchone()
-                            rewriter_agent = db.row_to_dict(row)
-                    if rewriter_agent is None:
-                        # fall back to project-level prototype if any
-                        rewriter_agent = agents.get(("channel_rewriter", "bi")) \
-                                         or agents.get(("channel_rewriter", ch["language"]))
-                    if rewriter_agent is None:
-                        # last resort: use raw body trimmed
-                        body = a["body_full"][: spec.max_chars]
-                    else:
-                        rew_out = self.executor.run(
-                            agent=rewriter_agent, pipeline_run_id=prid, article_id=a["id"],
-                            inputs=rewriter_inputs,
-                        ).output
-                        body = rew_out.get("post_body", "")
-                    headline = a["chosen_headline"]
-                    image_id = a["chosen_image_id"]
+                    body, headline, image_id = self._rewrite_for_channel(
+                        prid, agents, ch, spec, a)
                 post_id = db.new_id("po_")
                 with db.connect(self.settings.db_path) as conn:
                     conn.execute(
-                        "INSERT INTO posts (id, article_id, channel_id, body, headline, "
-                        "image_asset_id, status, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                        (post_id, a["id"], ch["id"], body, headline, image_id, "scheduled",
+                        "INSERT INTO posts (id, article_id, channel_id, body, "
+                        "headline, image_asset_id, status, scheduled_for, "
+                        "created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (post_id, a["id"], ch["id"], body, headline,
+                         image_id, "scheduled", _utc_iso(slot_dt),
                          db.now_iso()),
                     )
                 posts_created += 1
-                taken += 1
-                if dry_run:
-                    continue
-                # publish via adapter (mock by default)
-                creds = self._channel_creds(ch)
-                publisher = get_publisher(ch["kind"])
-                try:
-                    res = publisher.publish(
-                        post={"id": post_id, "body": body, "headline": headline,
-                              "image_asset_id": image_id, "language": ch["language"]},
-                        creds=creds, settings=self.settings,
-                    )
-                    with db.connect(self.settings.db_path) as conn:
-                        if res.ok:
-                            conn.execute(
-                                "UPDATE posts SET status='published', published_at=?, "
-                                "external_url=?, provider_meta=? WHERE id=?",
-                                (db.now_iso(), res.external_url,
-                                 db.jdump(res.raw_response), post_id),
-                            )
-                            posts_published += 1
-                        else:
-                            conn.execute(
-                                "UPDATE posts SET status='failed', error=?, provider_meta=? WHERE id=?",
-                                (res.error or "unknown", db.jdump(res.raw_response), post_id),
-                            )
-                except Exception as exc:
-                    with db.connect(self.settings.db_path) as conn:
-                        conn.execute(
-                            "UPDATE posts SET status='failed', error=? WHERE id=?",
-                            (repr(exc), post_id),
-                        )
-            # mark articles as published once at least one channel succeeded
         with db.connect(self.settings.db_path) as conn:
             conn.execute(
                 "UPDATE pipeline_runs SET status=?, finished_at=? WHERE id=?",
                 ("completed", db.now_iso(), prid),
             )
-        return {"posts_created": posts_created, "posts_published": posts_published,
+        posts_published = 0
+        if publish_immediately and not dry_run:
+            # One synchronous tick so the user sees published rows in
+            # the same request. The scheduler thread would do it on
+            # its next tick anyway; this just makes the demo snappy.
+            posts_published = publish_due_posts(self.settings)
+        return {"posts_created": posts_created,
+                "posts_published": posts_published,
                 "pipeline_run_id": prid}
+
+    def _upcoming_slots_utc(self, channel_id: str, tz_name: str,
+                            *, fallback_count: int,
+                            publish_immediately: bool) -> list:
+        """List of next-occurrence UTC datetimes for this channel's slots.
+
+        Reads enabled rows from ``channel_slots`` and converts each
+        ``time_local`` to the next future UTC moment in the project's
+        timezone. Falls back to ``fallback_count`` evenly-spaced
+        moments today if the channel has no slots configured (so old
+        projects keep working).
+
+        When ``publish_immediately=True`` we ignore slots entirely
+        and return ``fallback_count`` copies of "right now". This is
+        the smoke-test path; the scheduler will fire them at the
+        next tick or the synchronous tick at the end of
+        ``run_publication_phase`` will do it in this request.
+        """
+        from datetime import datetime, timezone, timedelta
+        if publish_immediately:
+            now = datetime.now(timezone.utc)
+            return [now for _ in range(max(1, fallback_count))]
+        with db.connect(self.settings.db_path) as conn:
+            slots = db.rows_to_list(conn.execute(
+                "SELECT time_local FROM channel_slots "
+                "WHERE channel_id=? AND enabled=1 ORDER BY time_local",
+                (channel_id,),
+            ).fetchall())
+        if slots:
+            return [next_slot_utc(s["time_local"], tz_name) for s in slots]
+        # No explicit slots — synthesize fallback_count moments
+        # spread across the next 24 h starting an hour from now. Old
+        # behaviour was "publish all immediately"; this is the
+        # gentlest replacement.
+        now = datetime.now(timezone.utc)
+        step = timedelta(hours=max(1, 24 // max(1, fallback_count)))
+        return [now + step * (i + 1) for i in range(fallback_count)]
+
+    def _rewrite_for_channel(self, prid: str, agents: dict, ch: dict,
+                             spec, article: dict) -> tuple[str, str, str | None]:
+        """Run the per-channel rewriter and return (body, headline, image_id).
+
+        Extracted from the old run_publication_phase so enqueueing can
+        happen ahead of the slot. The rewriter call is the expensive
+        part (one LLM round-trip per channel) — we make it once here
+        and store the rendered body in ``posts.body`` so the scheduler
+        only does the network call to the channel API at fire time.
+        """
+        rewriter_inputs = {
+            "article": {
+                "body_md": article["body_full"],
+                "title_working": article["chosen_headline"] or "",
+            },
+            "channel": {
+                "name": ch["name"], "kind": ch["kind"],
+                "max_chars": spec.max_chars,
+            },
+            "language": ch["language"],
+        }
+        rewriter_agent = None
+        if ch.get("rewriter_agent_id"):
+            with db.connect(self.settings.db_path) as conn:
+                row = conn.execute(
+                    "SELECT * FROM agents WHERE id=?",
+                    (ch["rewriter_agent_id"],),
+                ).fetchone()
+                if row:
+                    rewriter_agent = db.row_to_dict(row)
+        if rewriter_agent is None:
+            rewriter_agent = (agents.get(("channel_rewriter", "bi"))
+                              or agents.get(("channel_rewriter", ch["language"])))
+        if rewriter_agent is None:
+            body = article["body_full"][: spec.max_chars]
+        else:
+            rew_out = self.executor.run(
+                agent=rewriter_agent, pipeline_run_id=prid,
+                article_id=article["id"], inputs=rewriter_inputs,
+            ).output
+            body = rew_out.get("post_body", "")
+        return body, article["chosen_headline"], article["chosen_image_id"]
+
+
+    # ---------------- video phase ---------------------------------------
+
+    # 9:16 is hard-coded by product decision; the UI does not expose it.
+    VIDEO_ASPECT = "9:16"
+
+    def run_video_phase(self, article_id: str) -> dict[str, Any]:
+        """Generate a short-form video for one article (mock-friendly).
+
+        Pipeline (10 steps):
+            [1] load article + topic + project + agents
+            [2] video_scenarist[lang]                -> scenes JSON
+            [3] video_keyframe_artist[bi]            -> keyframes JSON
+            [4] for each scene: image_gen            -> per-scene PNG
+            [5] for each scene: video_gen            -> per-scene MP4 (5s)
+            [6] voice_director[lang]                 -> normalised voiceover
+            [7] for each scene: tts_gen              -> per-scene MP3
+            [8] whisper_transcribe (on combined audio in mock: first MP3)
+            [9] subtitle_styler[lang]                -> ASS file
+            [10] video_assembler                     -> final MP4 (chosen=1)
+
+        Each step inserts ``media_assets`` rows with a ``meta`` JSON
+        describing its purpose. Only the final MP4 has ``chosen=1`` for
+        ``kind='video'`` — that's the article-level video record the API
+        looks up.
+        """
+        # ---- [1] load article + project + agents ----
+        with db.connect(self.settings.db_path) as conn:
+            article_row = conn.execute(
+                "SELECT * FROM articles WHERE id=?", (article_id,)
+            ).fetchone()
+            if article_row is None:
+                raise KeyError(article_id)
+            article = db.row_to_dict(article_row) or {}
+            project = _project(conn, article["project_id"])
+            topic_row = conn.execute(
+                "SELECT * FROM topics WHERE id=?", (article["topic_id"],)
+            ).fetchone()
+            topic = db.row_to_dict(topic_row) if topic_row else {}
+            agents = _agents_by_role(conn, article["project_id"])
+        lang = (article.get("language") or "ru").lower()
+        # If the user disabled the corresponding video_<lang> team in
+        # Settings, refuse to run. The article page in the UI hides the
+        # "generate video" button in that case, so this is a defensive
+        # check for direct API callers.
+        enabled_teams = _enabled_teams_of(project)
+        team_id = f"video_{lang}"
+        if team_id not in enabled_teams:
+            raise RuntimeError(
+                f"video team for language={lang} is disabled in project "
+                f"settings (enabled_teams={sorted(enabled_teams)})"
+            )
+        prid = self._start_pipeline_run(article["project_id"], "video")
+
+        article_inputs = {
+            "title_working": article.get("chosen_headline") or "",
+            "body_md": article.get("body_full", ""),
+            "tldr": (article.get("chosen_headline") or "")[:200],
+        }
+
+        # ---- [2] video_scenarist ----
+        scenarist = (agents.get(("video_scenarist", lang))
+                     or agents.get(("video_scenarist", "bi")))
+        if not scenarist:
+            raise RuntimeError(
+                f"video_scenarist agent missing for language={lang}; "
+                f"run soft-migration / re-seed the project."
+            )
+        # target_duration_s may have been stored as a string ("15"/"30"/"60")
+        # because the UI uses a string-valued select; cast back to int here.
+        sc_params = json.loads(scenarist["params"]) if isinstance(scenarist["params"], str) \
+            else dict(scenarist["params"] or {})
+        try:
+            target_dur_int = int(str(sc_params.get("target_duration_s", 30)).strip())
+        except (TypeError, ValueError):
+            target_dur_int = 30
+        sc_params["target_duration_s"] = target_dur_int
+        scenarist_runtime = dict(scenarist)
+        scenarist_runtime["params"] = json.dumps(sc_params)
+        scenes_out = self.executor.run(
+            agent=scenarist_runtime, pipeline_run_id=prid, article_id=article_id,
+            inputs={"article": article_inputs, "topic": topic, "language": lang},
+        ).output
+        scenes = scenes_out.get("scenes", []) or []
+        if not scenes:
+            raise RuntimeError("video_scenarist returned no scenes")
+
+        # ---- [3] video_keyframe_artist ----
+        kf_agent = (agents.get(("video_keyframe_artist", "bi"))
+                    or agents.get(("video_keyframe_artist", lang)))
+        if not kf_agent:
+            raise RuntimeError("video_keyframe_artist agent missing")
+        kf_out = self.executor.run(
+            agent=kf_agent, pipeline_run_id=prid, article_id=article_id,
+            inputs={"scenes": scenes, "article": article_inputs, "language": lang},
+        ).output
+        keyframes = {int(k.get("idx", i + 1)): k
+                     for i, k in enumerate(kf_out.get("keyframes", []) or [])}
+
+        # Resolve the image model from the project's image_prompt_writer
+        # (so the user's UI choice for project images is reused for keyframes).
+        ipw = (agents.get(("image_prompt_writer", "bi"))
+               or agents.get(("image_prompt_writer", lang)))
+        ipw_params = (json.loads(ipw["params"])
+                      if ipw and isinstance(ipw["params"], str)
+                      else (ipw or {}).get("params") or {})
+        image_model = ipw_params.get("image_model", "mock:placeholder") or "mock:placeholder"
+
+        kf_params = json.loads(kf_agent["params"]) if isinstance(kf_agent["params"], str) \
+            else dict(kf_agent["params"] or {})
+        video_model = kf_params.get("video_model", "302ai:wan2.7-i2v")
+
+        # ---- [4] image_gen per scene + [5] video_gen per scene ----
+        scene_clips: list[dict[str, Any]] = []
+        for i, scene in enumerate(scenes):
+            idx = int(scene.get("idx", i + 1))
+            duration = float(scene.get("duration_s") or 5.0)
+            kf = keyframes.get(idx) or {}
+            image_prompt = kf.get("image_prompt") or (
+                f"cinematic still: {scene.get('b_roll_idea') or 'scene'}, aspect 9:16"
+            )
+            i2v_prompt = kf.get("i2v_prompt") or "slow zoom in"
+            # [4] image
+            img = generate_image(image_prompt, settings=self.settings,
+                                  idx=idx, model=image_model)
+            img_id = db.new_id("ma_")
+            with db.connect(self.settings.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO media_assets (id, article_id, project_id, kind, "
+                    "language, prompt, model, storage_url, mime, width, height, "
+                    "chosen, cost_usd, meta, created_at) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        img_id, article_id, article["project_id"], "image",
+                        lang, image_prompt, img.model, img.storage_url, img.mime,
+                        img.width, img.height, 0,
+                        float(img.cost_usd or 0.0),
+                        db.jdump({"scene_idx": idx, "purpose": "video_keyframe",
+                                   "topic_id": article.get("topic_id")}),
+                        db.now_iso(),
+                    ),
+                )
+            # [5] video clip
+            clip = generate_video_clip(
+                img.storage_url, i2v_prompt, settings=self.settings,
+                idx=idx, model=video_model, duration_s=duration,
+            )
+            clip_id = db.new_id("ma_")
+            with db.connect(self.settings.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO media_assets (id, article_id, project_id, kind, "
+                    "language, prompt, model, storage_url, mime, width, height, "
+                    "duration_s, chosen, cost_usd, meta, created_at) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        clip_id, article_id, article["project_id"], "video",
+                        lang, i2v_prompt, clip.model, clip.storage_url, clip.mime,
+                        clip.width, clip.height, clip.duration_s, 0,
+                        float(clip.cost_usd or 0.0),
+                        db.jdump({"scene_idx": idx, "purpose": "video_scene_clip"}),
+                        db.now_iso(),
+                    ),
+                )
+            scene_clips.append({
+                "idx": idx,
+                "clip_url": clip.storage_url,
+                "clip_path": os.path.join(self.settings.media_dir,
+                                            os.path.basename(clip.storage_url)),
+                "duration_s": duration,
+                "voiceover": scene.get("voiceover", ""),
+            })
+
+        # ---- [6] voice_director ----
+        vd_agent = (agents.get(("voice_director", lang))
+                    or agents.get(("voice_director", "bi")))
+        if not vd_agent:
+            raise RuntimeError(f"voice_director agent missing for language={lang}")
+        vd_out = self.executor.run(
+            agent=vd_agent, pipeline_run_id=prid, article_id=article_id,
+            inputs={"scenes": scenes, "language": lang},
+        ).output
+        normalized = {int(s.get("idx", i + 1)): s
+                      for i, s in enumerate(vd_out.get("scenes_normalized", []) or [])}
+        vd_params = json.loads(vd_agent["params"]) if isinstance(vd_agent["params"], str) \
+            else dict(vd_agent["params"] or {})
+        tts_model = vd_params.get("tts_model", "openai:gpt-4o-mini-tts")
+        voice_id = vd_params.get("voice_id", "onyx")
+        speed = float(vd_params.get("speed", 1.0) or 1.0)
+
+        # ---- [7] tts_gen per scene ----
+        for sc in scene_clips:
+            norm = normalized.get(sc["idx"]) or {}
+            text = (norm.get("voiceover_normalized")
+                    or sc.get("voiceover")
+                    or (f"Сцена {sc['idx']}." if lang == "ru" else f"Scene {sc['idx']}."))
+            tts = generate_tts(text, settings=self.settings, idx=sc["idx"],
+                                model=tts_model, voice_id=voice_id,
+                                speed=speed, language=lang)
+            tts_id = db.new_id("ma_")
+            with db.connect(self.settings.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO media_assets (id, article_id, project_id, kind, "
+                    "language, prompt, model, storage_url, mime, "
+                    "duration_s, chosen, cost_usd, meta, created_at) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        tts_id, article_id, article["project_id"], "audio",
+                        lang, text, tts.model, tts.storage_url, tts.mime,
+                        tts.duration_s, 0,
+                        float(tts.cost_usd or 0.0),
+                        db.jdump({"scene_idx": sc["idx"], "purpose": "voiceover",
+                                   "voice_id": tts.voice_id}),
+                        db.now_iso(),
+                    ),
+                )
+            sc["audio_url"] = tts.storage_url
+            sc["audio_path"] = os.path.join(self.settings.media_dir,
+                                              os.path.basename(tts.storage_url))
+
+        # ---- [8] combine audio (concat all scene MP3s) + transcribe ----
+        # Whisper sees the WHOLE voiceover as one stream so the resulting
+        # SRT timestamps cover the full final video. Without concat we'd
+        # only get subtitles for the first scene, and burn-in over the
+        # concatenated MP4 would silently drop after that.
+        from .tools.video_assembler import concat_audio_files
+        scene_audio_paths = [sc.get("audio_path", "") for sc in scene_clips]
+        combined_audio_path = concat_audio_files(
+            scene_audio_paths,
+            settings=self.settings,
+            out_basename=f"{article_id}_{lang}_combined.mp3",
+        ) or (scene_clips[0]["audio_path"] if scene_clips else "")
+        # transcribe_audio expects a /media/<file> URL (it resolves to a
+        # local file under settings.media_dir), so build that from the
+        # absolute path concat_audio_files returned.
+        combined_audio_url = (
+            "/media/" + os.path.basename(combined_audio_path)
+            if combined_audio_path else ""
+        )
+        srt = transcribe_audio(combined_audio_url, settings=self.settings, language=lang)
+
+        # ---- [9] subtitle_styler -> ASS file ----
+        ss_agent = (agents.get(("subtitle_styler", lang))
+                    or agents.get(("subtitle_styler", "bi")))
+        if not ss_agent:
+            raise RuntimeError(f"subtitle_styler agent missing for language={lang}")
+        ss_out = self.executor.run(
+            agent=ss_agent, pipeline_run_id=prid, article_id=article_id,
+            inputs={"srt_text": srt.srt_text, "language": lang},
+        ).output
+        ass_text = ss_out.get("ass_text") or ""
+        ass_filename = f"{article_id}_{lang}.ass"
+        ass_path = os.path.join(self.settings.media_dir, ass_filename)
+        os.makedirs(self.settings.media_dir, exist_ok=True)
+        with open(ass_path, "w", encoding="utf-8") as fh:
+            fh.write(ass_text)
+        ass_id = db.new_id("ma_")
+        with db.connect(self.settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO media_assets (id, article_id, project_id, kind, "
+                "language, prompt, model, storage_url, mime, "
+                "chosen, cost_usd, meta, created_at) VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ass_id, article_id, article["project_id"], "subtitle",
+                    lang, "", "openai:whisper-1+subtitle_styler",
+                    f"/media/{ass_filename}", "text/x-ass",
+                    0,
+                    # Whisper bills per minute of input audio. We
+                    # attribute that cost to the subtitle asset (the
+                    # ASS file is the user-visible artefact of the
+                    # transcription step). subtitle_styler itself is
+                    # a regular LLM agent and is already billed via
+                    # agent_runs.
+                    float(srt.cost_usd or 0.0),
+                    db.jdump({"format": "ass", "purpose": "final_subtitles",
+                               "srt_duration_s": srt.duration_s}),
+                    db.now_iso(),
+                ),
+            )
+
+        # ---- [10] video_assembler -> final MP4 ----
+        scenes_for_assembler = [
+            {
+                "clip_path": sc["clip_path"],
+                "audio_path": sc.get("audio_path", ""),
+                "ass_path": ass_path,
+                "duration_s": sc["duration_s"],
+            }
+            for sc in scene_clips
+        ]
+        final = assemble_video(
+            scenes_for_assembler, settings=self.settings,
+            article_id=article_id, language=lang,
+        )
+        final_id = db.new_id("ma_")
+        with db.connect(self.settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO media_assets (id, article_id, project_id, kind, "
+                "language, prompt, model, storage_url, mime, width, height, "
+                "duration_s, chosen, cost_usd, meta, created_at) VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    final_id, article_id, article["project_id"], "video",
+                    lang, "", video_model, final.storage_url, final.mime,
+                    final.width, final.height, final.duration_s, 1,
+                    # Final assembled MP4 is a local ffmpeg merge of
+                    # already-billed scene clips + audio + ASS subs.
+                    # No external API call -> $0. The per-scene clip
+                    # rows (kind='video', purpose='video_scene_clip')
+                    # carry the actual Wan i2v charges.
+                    0.0,
+                    db.jdump({"purpose": "final",
+                               "scenes_count": len(scene_clips),
+                               "aspect": self.VIDEO_ASPECT,
+                               "topic_id": article.get("topic_id")}),
+                    db.now_iso(),
+                ),
+            )
+            conn.execute(
+                "UPDATE pipeline_runs SET status='completed', finished_at=? WHERE id=?",
+                (db.now_iso(), prid),
+            )
+        return {
+            "final_video_url": final.storage_url,
+            "scenes_count": len(scene_clips),
+            "duration_s": final.duration_s,
+            "media_asset_id": final_id,
+        }
+
 
     # ---------------- helpers --------------------------------------------
 

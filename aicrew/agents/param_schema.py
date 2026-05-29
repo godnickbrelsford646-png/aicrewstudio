@@ -252,6 +252,24 @@ QA_EDITORIAL_FIELDS: list[ParamField] = [
 
 
 # ============================================================================
+# 9c. Фактаудит — пост-писательский фактчек
+# ============================================================================
+# Проверяет, что каждое имя/цифра/цитата из готовой статьи действительно
+# присутствует в research_validated. Пороги строже, чем у qa_editorial,
+# потому что один выдуманный факт убивает доверие ко всей статье — а
+# qa_editorial судит только литературное качество.
+FACT_AUDIT_FIELDS: list[ParamField] = [
+    ParamField(
+        key="min_score",
+        label="Минимальная оценка для прохождения фактаудита",
+        hint="0–100. Score = 100 минус penalty по unsupported_claims "
+             "(low=2, med=10, high=25). Если ниже — must_fix=true.",
+        type="int", default=80, min=0, max=100,
+    ),
+]
+
+
+# ============================================================================
 # 9b. QA визуальный — нет настраиваемых параметров
 # ============================================================================
 QA_VISUAL_FIELDS: list[ParamField] = []
@@ -277,18 +295,12 @@ VIDEO_SCENARIST_FIELDS: list[ParamField] = [
     ParamField(
         key="target_duration_s",
         label="Длительность видео (секунд)",
-        hint="Оптимум для Shorts/Reels/TikTok: 30–45 секунд.",
-        type="int", default=45, min=10, max=120,
-    ),
-    ParamField(
-        key="aspect",
-        label="Соотношение сторон",
-        hint="9:16 — для Shorts/Reels/TikTok. 1:1 — для ленты. 16:9 — для YouTube/VK Видео.",
-        type="select", default="9:16",
+        hint="Оптимум для Shorts/Reels/TikTok: 30 секунд. 15 — для динамичных тизеров, 60 — для развёрнутого сюжета.",
+        type="select", default="30",
         options=[
-            {"value": "9:16",  "label": "9:16 (вертикальное)"},
-            {"value": "1:1",   "label": "1:1 (квадрат)"},
-            {"value": "16:9",  "label": "16:9 (горизонтальное)"},
+            {"value": "15", "label": "15 секунд"},
+            {"value": "30", "label": "30 секунд"},
+            {"value": "60", "label": "60 секунд"},
         ],
     ),
     ParamField(
@@ -307,6 +319,127 @@ VIDEO_SCENARIST_FIELDS: list[ParamField] = [
 
 
 # ============================================================================
+# 12. Художник ключевых кадров видео
+# ============================================================================
+VIDEO_KEYFRAME_ARTIST_FIELDS: list[ParamField] = [
+    ParamField(
+        key="video_model",
+        label="Модель генерации видео",
+        hint="Из чего собирать движение из ключевого кадра.",
+        type="select", default="302ai:wan2.7-i2v",
+        options=[
+            {"value": "302ai:wan2.7-i2v",
+             "label": "302.ai · Wan 2.7 i2v 720P ($0.10/сек) — рекомендуется"},
+            {"value": "302ai:wan2.2-i2v-flash",
+             "label": "302.ai · Wan 2.2 i2v Flash 720P ($0.04/сек) — самый дешёвый"},
+            {"value": "302ai:wan2.2-i2v-plus",
+             "label": "302.ai · Wan 2.2 i2v Plus 1080P ($0.15/сек)"},
+            {"value": "302ai:wan2.6-i2v",
+             "label": "302.ai · Wan 2.6 i2v 720P ($0.10/сек) — multi-shot"},
+            {"value": "302ai:wan2.5-i2v-preview",
+             "label": "302.ai · Wan 2.5 i2v Preview 720P ($0.10/сек)"},
+            {"value": "302ai:wanx2.1-i2v-turbo",
+             "label": "302.ai · Wanx 2.1 i2v Turbo 720P ($0.05/сек) — legacy"},
+            {"value": "302ai:wanx2.1-i2v-plus",
+             "label": "302.ai · Wanx 2.1 i2v Plus 720P ($0.15/сек) — legacy"},
+            {"value": "mock:placeholder",
+             "label": "Заглушка (без API, для тестов)"},
+        ],
+    ),
+    ParamField(
+        key="style_preset",
+        label="Стиль анимации",
+        hint="Общая визуальная подача движения.",
+        type="select", default="cinematic_historical",
+        options=[
+            {"value": "cinematic_historical", "label": "Кинематографичный исторический"},
+            {"value": "documentary",          "label": "Документальный"},
+            {"value": "kinetic_typography",   "label": "Кинетическая типографика"},
+        ],
+    ),
+]
+
+
+# ============================================================================
+# 13. Режиссёр озвучки
+# ============================================================================
+VOICE_DIRECTOR_FIELDS: list[ParamField] = [
+    ParamField(
+        key="tts_model",
+        label="Модель озвучки",
+        hint="Чем синтезировать голос.",
+        type="select", default="openai:gpt-4o-mini-tts",
+        options=[
+            {"value": "openai:gpt-4o-mini-tts",
+             "label": "OpenAI gpt-4o-mini-tts ($0.015 / мин)"},
+        ],
+    ),
+    ParamField(
+        key="voice_id",
+        label="Голос",
+        hint="Какой голос использовать. Для русского лучше Onyx или Echo.",
+        type="select", default="onyx",
+        options=[{"value": v, "label": v.capitalize()} for v in
+                 ["alloy", "ash", "ballad", "coral", "echo", "fable",
+                  "nova", "onyx", "sage", "shimmer", "verse"]],
+    ),
+    ParamField(
+        key="speed",
+        label="Скорость речи",
+        hint="1.0 — нормальная.",
+        type="float", default=1.0, min=0.5, max=2.0, step=0.05,
+    ),
+]
+
+
+# ============================================================================
+# 14. Оформитель субтитров
+# ============================================================================
+SUBTITLE_STYLER_FIELDS: list[ParamField] = [
+    ParamField(
+        key="font",
+        label="Шрифт",
+        hint="Имя системного шрифта.",
+        type="text", default="Inter",
+    ),
+    ParamField(
+        key="font_size",
+        label="Размер шрифта",
+        type="int", default=54, min=20, max=120, hint="Высота в пикселях.",
+    ),
+    ParamField(
+        key="color",
+        label="Цвет (HEX)",
+        hint="Например, #FFFFFF — белый, #FFD400 — жёлтый.",
+        type="text", default="#FFFFFF",
+    ),
+    ParamField(
+        key="position",
+        label="Положение на экране",
+        hint="Куда выводить субтитры в кадре 9:16.",
+        type="select", default="bottom_center",
+        options=[
+            {"value": "top_center",    "label": "Сверху по центру"},
+            {"value": "middle",        "label": "По центру"},
+            {"value": "bottom_center", "label": "Снизу по центру"},
+        ],
+    ),
+    ParamField(
+        key="highlight_keywords",
+        label="Подсвечивать ключевые слова",
+        hint="Включить выделение ключевых слов цветом.",
+        type="bool", default=True,
+    ),
+]
+
+
+# ============================================================================
+# 15. Сборщик видео — без настроек
+# ============================================================================
+VIDEO_ASSEMBLER_FIELDS: list[ParamField] = []
+
+
+# ============================================================================
 # Registry
 # ============================================================================
 PARAM_SCHEMAS: dict[str, list[ParamField]] = {
@@ -319,9 +452,14 @@ PARAM_SCHEMAS: dict[str, list[ParamField]] = {
     "headline_writer":     HEADLINE_WRITER_FIELDS,
     "image_prompt_writer": IMAGE_PROMPT_WRITER_FIELDS,
     "qa_editorial":        QA_EDITORIAL_FIELDS,
+    "fact_audit":          FACT_AUDIT_FIELDS,
     "qa_visual":           QA_VISUAL_FIELDS,
     "channel_rewriter":    CHANNEL_REWRITER_FIELDS,
     "video_scenarist":     VIDEO_SCENARIST_FIELDS,
+    "video_keyframe_artist": VIDEO_KEYFRAME_ARTIST_FIELDS,
+    "voice_director":      VOICE_DIRECTOR_FIELDS,
+    "subtitle_styler":     SUBTITLE_STYLER_FIELDS,
+    "video_assembler":     VIDEO_ASSEMBLER_FIELDS,
 }
 
 

@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS projects (
     daily_articles_target    INTEGER NOT NULL DEFAULT 2,
     budget_usd_month         REAL NOT NULL DEFAULT 50.0,
     style_guide              TEXT NOT NULL DEFAULT '',
+    enabled_teams            TEXT NOT NULL DEFAULT '["text_ru","text_en","video_ru","video_en"]',
     created_at               TEXT NOT NULL,
     updated_at               TEXT NOT NULL
 );
@@ -135,6 +136,7 @@ CREATE TABLE IF NOT EXISTS topics (
     score_total     REAL NOT NULL DEFAULT 0,
     scores          TEXT NOT NULL DEFAULT '{}',
     fingerprint     TEXT NOT NULL,
+    event_date      TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_topics_project_status ON topics(project_id, status);
@@ -173,6 +175,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
     height        INTEGER,
     duration_s    REAL,
     chosen        INTEGER NOT NULL DEFAULT 0,
+    cost_usd      REAL NOT NULL DEFAULT 0,
     meta          TEXT NOT NULL DEFAULT '{}',
     created_at    TEXT NOT NULL
 );
@@ -263,6 +266,222 @@ def init_schema(db_path: str) -> None:
             cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if col not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        # Soft migration: topics.event_date for date-anchored projects
+        # (e.g. «Задним числом»). Older DBs created before this column
+        # existed get it backfilled with empty string. The pipeline reads
+        # event_date from the topic_validator output and writes it here so
+        # researcher / writer / headline / qa agents can re-anchor to the
+        # exact event date downstream.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(topics)").fetchall()]
+        if "event_date" not in cols:
+            conn.execute(
+                "ALTER TABLE topics ADD COLUMN event_date TEXT NOT NULL DEFAULT ''"
+            )
+        # Soft migration: posts.attempts / posts.last_attempt_at for the
+        # background scheduler. The scheduler retries failed publications
+        # with exponential backoff up to MAX_PUBLISH_ATTEMPTS times; we
+        # need a counter and a timestamp to compute the next eligible
+        # retry. Older DBs created before the scheduler was added get
+        # these columns backfilled here.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(posts)").fetchall()]
+        if "attempts" not in cols:
+            conn.execute(
+                "ALTER TABLE posts ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_attempt_at" not in cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN last_attempt_at TEXT")
+        # Soft migration: projects.enabled_teams. Each project owns a JSON
+        # array of enabled team ids (text_ru / text_en / video_ru / video_en).
+        # The pipeline skips disabled teams; the UI hides their cards. Older
+        # DBs created before this column existed get it backfilled with the
+        # full default set so no team is silently disabled by an upgrade.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(projects)").fetchall()]
+        if "enabled_teams" not in cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN enabled_teams TEXT")
+        # Backfill NULL/empty rows. Done unconditionally — cheap on small DBs
+        # and safe (only touches rows where the value isn't set yet). The
+        # default set is intentionally maximal: even projects with
+        # language_modes=["ru"] get all four ids, which the API/UI then
+        # filters by language_modes when rendering.
+        conn.execute(
+            "UPDATE projects SET enabled_teams = ? "
+            "WHERE enabled_teams IS NULL OR enabled_teams = ''",
+            (json.dumps(["text_ru", "text_en", "video_ru", "video_en"]),),
+        )
+
+        # Soft migration: media_assets.cost_usd for the cost-tracking
+        # dashboard. Older rows get 0 (correct for mock/placeholder
+        # assets, and an acceptable lossy-zero for real-API media we
+        # can't backfill — see docs/03-data-model.md). Idempotent:
+        # ALTER is gated on the column not already existing.
+        cols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(media_assets)").fetchall()]
+        if "cost_usd" not in cols:
+            conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0"
+            )
+
+        # Soft migration: rename the obsolete video_model
+        # ``"302ai:wan2.2-i2v"`` (which 302.ai never actually exposed —
+        # production calls returned HTTP 503 "No available models
+        # currently") to the new default ``"302ai:wan2.7-i2v"``.
+        # Idempotent: re-running on rows that were already migrated
+        # is a no-op (REPLACE matches nothing). The negative LIKE
+        # protects valid suffixed names like wan2.2-i2v-plus and
+        # wan2.2-i2v-flash from being touched.
+        conn.execute(
+            "UPDATE agents SET "
+            "  params = REPLACE(params, "
+            "    '\"302ai:wan2.2-i2v\"', '\"302ai:wan2.7-i2v\"'), "
+            "  updated_at = ? "
+            "WHERE role='video_keyframe_artist' "
+            "  AND params LIKE '%302ai:wan2.2-i2v%' "
+            "  AND params NOT LIKE '%302ai:wan2.2-i2v-%'",
+            (now_iso(),),
+        )
+
+        # Sync ZADNIM-style agents with the latest prompts / params /
+        # model config. Idempotent: re-running just re-applies the same
+        # values. Used when a release ships new anti-hallucination rules
+        # — without this hook, existing production DBs keep stale
+        # snapshots of prompt_template (since prompts are stored on
+        # agents.prompt_template at seed time).
+        #
+        # Lazy import to avoid a circular: seed.py imports db at module
+        # load time (for db.connect / db.now_iso), so we cannot import
+        # seed at the top of this file.
+        try:
+            from . import seed as _seed
+        except ImportError:
+            _seed = None
+        if _seed is not None:
+            _sync_zadnim_agents(conn, _seed)
+
+
+def _sync_zadnim_agents(conn, seed_module) -> None:
+    """Re-apply ZADNIM_PROMPTS / VIDEO_TEAM_PROMPTS / ZADNIM_AGENT_CONFIG /
+    ZADNIM_AGENT_PARAMS onto every existing agent that owns one of those
+    roles, and create missing fact_audit agents for projects that already
+    have a text team.
+
+    Idempotent. Designed to be called from ``init_schema`` on every
+    application startup so that prompt fixes ship without manual SQL.
+
+    Skips:
+      * channel_rewriter — its prompt is per-channel and lives in
+        REWRITER_PROMPTS, not ZADNIM_PROMPTS.
+      * video_assembler — non-LLM role; its prompt template is a stub
+        and there is no benefit to re-applying it.
+    """
+    zadnim = getattr(seed_module, "ZADNIM_PROMPTS", {}) or {}
+    video_team = getattr(seed_module, "VIDEO_TEAM_PROMPTS", {}) or {}
+    agent_config = getattr(seed_module, "ZADNIM_AGENT_CONFIG", {}) or {}
+    agent_params = getattr(seed_module, "ZADNIM_AGENT_PARAMS", {}) or {}
+
+    # 1) Refresh existing agents in place.
+    rows = conn.execute(
+        "SELECT id, project_id, role, language, prompt_template, model, "
+        "temperature, max_tokens, params FROM agents"
+    ).fetchall()
+    for row in rows:
+        role = row["role"]
+        # Skip channels — they own a per-channel rewriter prompt, not a
+        # role-level one. Skip video_assembler — non-LLM stub.
+        if role in ("channel_rewriter", "video_assembler"):
+            continue
+        # Pick prompt: VIDEO_TEAM_PROMPTS wins over ZADNIM_PROMPTS for
+        # roles that exist in both (matches seed.seed() priority).
+        if role in video_team:
+            prompt = video_team[role]
+        elif role in zadnim:
+            prompt = zadnim[role]
+        else:
+            # Role not managed by ZADNIM overrides — leave it alone.
+            continue
+        # Pick model triple: leave the existing values untouched if the
+        # role is missing from ZADNIM_AGENT_CONFIG.
+        cfg = agent_config.get(role)
+        if cfg is not None:
+            model, temp, max_tok = cfg
+        else:
+            model = row["model"]
+            temp = row["temperature"]
+            max_tok = row["max_tokens"]
+        # Merge params: take the existing dict and overlay any keys from
+        # ZADNIM_AGENT_PARAMS so a release adding a new param flag does
+        # not silently revert user-customised values for keys it doesn't
+        # touch.
+        try:
+            existing_params = json.loads(row["params"]) if row["params"] else {}
+            if not isinstance(existing_params, dict):
+                existing_params = {}
+        except (TypeError, json.JSONDecodeError):
+            existing_params = {}
+        zad_params = agent_params.get(role)
+        if isinstance(zad_params, dict):
+            merged = dict(existing_params)
+            merged.update(zad_params)
+        else:
+            merged = existing_params
+        conn.execute(
+            "UPDATE agents SET prompt_template=?, model=?, temperature=?, "
+            "max_tokens=?, params=?, updated_at=? WHERE id=?",
+            (prompt, model, float(temp), int(max_tok),
+             json.dumps(merged, ensure_ascii=False),
+             now_iso(), row["id"]),
+        )
+
+    # 2) Create missing fact_audit agents for projects that already have
+    # a text team (i.e. at least one researcher or article_writer agent).
+    # We do this for every distinct (project_id, language) pair found in
+    # the existing text-team agents, so the new fact_audit agent matches
+    # the project's language footprint.
+    if "fact_audit" not in zadnim and "fact_audit" not in video_team:
+        return  # Prompt template missing — nothing to seed.
+    fa_prompt = zadnim.get("fact_audit") or video_team.get("fact_audit")
+    fa_cfg = agent_config.get("fact_audit") or ("mock:smart", 0.2, 2500)
+    fa_params = agent_params.get("fact_audit") or {"min_score": 80}
+    fa_display_map = {"ru": "Fact Audit (RU)", "en": "Fact Audit (EN)"}
+    fa_description = (
+        "Post-writer factchecker: verifies every name, number and "
+        "quote in the article body against the validated research "
+        "brief; rewrites unsupported fragments."
+    )
+    project_lang_pairs = conn.execute(
+        "SELECT DISTINCT project_id, language FROM agents "
+        "WHERE role IN ('researcher', 'article_writer') "
+        "AND language IN ('ru','en')"
+    ).fetchall()
+    for pair in project_lang_pairs:
+        proj_id = pair["project_id"]
+        lang = pair["language"]
+        # Already exists? Keep idempotent.
+        existing = conn.execute(
+            "SELECT 1 FROM agents WHERE project_id=? AND role='fact_audit' "
+            "AND language=?",
+            (proj_id, lang),
+        ).fetchone()
+        if existing:
+            continue
+        slug = unique_slug(conn, "agents", f"fact-audit-{lang}",
+                           scope_col="project_id", scope_val=proj_id)
+        conn.execute(
+            "INSERT INTO agents (id, project_id, slug, role, display_name, "
+            "description, model, temperature, max_tokens, top_p, "
+            "prompt_template, params, tools_enabled, language, is_enabled, "
+            "created_at, updated_at) VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                new_id("ag_"), proj_id, slug, "fact_audit",
+                fa_display_map.get(lang, f"Fact Audit ({lang.upper()})"),
+                fa_description,
+                fa_cfg[0], float(fa_cfg[1]), int(fa_cfg[2]), 1.0,
+                fa_prompt,
+                json.dumps(fa_params, ensure_ascii=False),
+                json.dumps([]),
+                lang, 1, now_iso(), now_iso(),
+            ),
+        )
 
 
 # --------------------------------------------------------------------- slug --
