@@ -937,7 +937,7 @@ class PipelineRunner:
 
         kf_params = json.loads(kf_agent["params"]) if isinstance(kf_agent["params"], str) \
             else dict(kf_agent["params"] or {})
-        video_model = kf_params.get("video_model", "302ai:wan2.2-i2v")
+        video_model = kf_params.get("video_model", "302ai:wan2.7-i2v")
 
         # ---- [4] image_gen per scene + [5] video_gen per scene ----
         scene_clips: list[dict[str, Any]] = []

@@ -965,7 +965,7 @@ ROLES: dict[str, AgentRoleSpec] = {
         default_temperature=0.6,
         default_max_tokens=1500,
         prompt_template=VIDEO_KEYFRAME_ARTIST_TMPL,
-        default_params={"video_model": "302ai:wan2.2-i2v",
+        default_params={"video_model": "302ai:wan2.7-i2v",
                         "style_preset": "cinematic_historical"},
     ),
     "voice_director": AgentRoleSpec(

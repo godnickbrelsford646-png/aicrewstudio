@@ -48,10 +48,34 @@ IMAGE_PRICES: dict[str, float] = {
     "mock:placeholder":     0.0,
 }
 
-# Image-to-video: USD per 5 seconds of generated clip.
+# Image-to-video: USD per second of generated clip (302.ai bills i2v
+# linearly by output duration). The "wan2.2-i2v" name 302.ai never
+# actually exposed — production calls returned HTTP 503 "No available
+# models currently". Real i2v models all carry a suffix:
+#   wan2.2-i2v-plus / wan2.2-i2v-flash / wan2.5-i2v-preview /
+#   wan2.6-i2v / wan2.7-i2v / wanx2.1-i2v-{turbo,plus} / happyhorse-1.0-i2v
+# We pick the most common resolution per model (matches what we send
+# in parameters.resolution); when the user picks a different
+# resolution this stays a sane upper-bound estimate for the dashboard.
 VIDEO_PRICES: dict[str, float] = {
-    "302ai:wan2.2-i2v":     0.12,
-    "mock:placeholder":     0.0,
+    # Wan 2.7 i2v — newest. Our default. Sweet spot for quality/price.
+    "302ai:wan2.7-i2v":          0.10,   # 720P
+    # Wan 2.2 family — older but cheap.
+    "302ai:wan2.2-i2v-plus":     0.15,   # 1080P
+    "302ai:wan2.2-i2v-flash":    0.04,   # 720P
+    # Wan 2.5 / 2.6 — also valid choices.
+    "302ai:wan2.5-i2v-preview":  0.10,   # 720P
+    "302ai:wan2.6-i2v":          0.10,   # 720P
+    # Older Wanx 2.1 — keep for completeness.
+    "302ai:wanx2.1-i2v-turbo":   0.05,
+    "302ai:wanx2.1-i2v-plus":    0.15,
+    # Specialty.
+    "302ai:happyhorse-1.0-i2v":  0.156,
+    # Mock.
+    "mock:placeholder":          0.0,
+    # Backwards-compat alias for any DB row still carrying the obsolete
+    # bare name. Same price as wan2.7-i2v which we migrate to.
+    "302ai:wan2.2-i2v":          0.10,
 }
 
 # TTS: USD per 1M characters of input text. gpt-4o-mini-tts is the cheap
@@ -84,11 +108,12 @@ def estimate_image_cost(model: str, count: int = 1) -> float:
 def estimate_video_cost(model: str, duration_s: float) -> float:
     """USD cost for a clip of ``duration_s`` seconds.
 
-    Rates are quoted per 5s on 302.ai's invoice but bill linearly within
-    a clip — a 10s i2v call costs 2x a 5s call.
+    302.ai bills i2v linearly per output second (a 10s clip costs 2x a
+    5s one). At wan2.7-i2v 720P that is $0.10/s; a 5s clip is $0.50,
+    a 10s clip is $1.00.
     """
-    p = VIDEO_PRICES.get(model, 0.0)
-    return round(p * (max(0.0, float(duration_s)) / 5.0), 6)
+    rate_per_sec = VIDEO_PRICES.get(model, 0.0)
+    return round(rate_per_sec * max(0.0, float(duration_s)), 6)
 
 
 def estimate_tts_cost(model: str, chars: int) -> float:

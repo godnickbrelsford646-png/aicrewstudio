@@ -653,7 +653,7 @@ class WanI2VAsyncFlowTest(unittest.TestCase):
                 "/media/keyframe_test.png",
                 "slow zoom in on a battlefield",
                 settings=self.settings, idx=1,
-                model="302ai:wan2.2-i2v",
+                model="302ai:wan2.7-i2v",
                 duration_s=5.0,
             )
 
@@ -667,9 +667,9 @@ class WanI2VAsyncFlowTest(unittest.TestCase):
             f"unexpected submit url: {submit_url}",
         )
         # Submit body uses input.img_url (NOT image_url, NOT input_image),
-        # passes the prompt through, and includes integer duration + 9:16 size.
+        # passes the prompt through, and includes integer duration + 1080P resolution.
         submit_body = json.loads(submit_body_raw.decode("utf-8"))
-        self.assertEqual(submit_body["model"], "wan2.2-i2v")
+        self.assertEqual(submit_body["model"], "wan2.7-i2v")
         self.assertEqual(
             submit_body["input"]["prompt"],
             "slow zoom in on a battlefield",
@@ -680,7 +680,7 @@ class WanI2VAsyncFlowTest(unittest.TestCase):
             "https://mepoststream.site/media/keyframe_test.png",
         )
         self.assertEqual(submit_body["parameters"]["duration"], 5)
-        self.assertEqual(submit_body["parameters"]["size"], "1080*1920")
+        self.assertEqual(submit_body["parameters"]["resolution"], "1080P")
         # Polled at least twice (RUNNING -> SUCCEEDED).
         poll_count = sum(1 for u, _, _ in seen if "/tasks/task-i2v" in u)
         self.assertGreaterEqual(poll_count, 2)
@@ -729,7 +729,7 @@ class WanI2VAsyncFlowTest(unittest.TestCase):
                 "/media/anything.png",
                 "any motion",
                 settings=self.settings, idx=2,
-                model="302ai:wan2.2-i2v",
+                model="302ai:wan2.7-i2v",
                 duration_s=5.0,
             )
         # We get a placeholder back, not a real video.
@@ -746,7 +746,7 @@ class WanI2VAsyncFlowTest(unittest.TestCase):
                   "r", encoding="utf-8") as fh:
             err_content = fh.read()
         self.assertIn("img_url not reachable", err_content)
-        self.assertIn("302ai:wan2.2-i2v", err_content)
+        self.assertIn("302ai:wan2.7-i2v", err_content)
 
 
 class OpenAITTSFlowTest(unittest.TestCase):
@@ -1530,6 +1530,69 @@ class AntiHallucinationTest(unittest.TestCase):
         self.assertEqual(second, third,
                          "second re-run of init_schema must not change agent count")
 
+    # --- 5b) migration: rename obsolete wan2.2-i2v video model -------------
+
+    def test_video_model_migration_renames_wan22_to_wan27(self) -> None:
+        """init_schema must rename the obsolete bare ``302ai:wan2.2-i2v``
+        (which 302.ai never exposed; production calls returned HTTP 503
+        "No available models currently") to ``302ai:wan2.7-i2v``.
+        """
+        info = seed(self.settings)
+        project_id = info["project_id"]
+        # Force the obsolete name onto the keyframe artist agent.
+        with db.connect(self.settings.db_path) as conn:
+            conn.execute(
+                "UPDATE agents SET params = json_set(params, "
+                "'$.video_model', '302ai:wan2.2-i2v') "
+                "WHERE project_id=? AND role='video_keyframe_artist'",
+                (project_id,),
+            )
+            sanity = conn.execute(
+                "SELECT json_extract(params,'$.video_model') AS m FROM agents "
+                "WHERE project_id=? AND role='video_keyframe_artist'",
+                (project_id,),
+            ).fetchone()
+            self.assertEqual(sanity["m"], "302ai:wan2.2-i2v",
+                             "test setup: agent should now hold the obsolete name")
+        # Re-run init_schema; the migration must rewrite the model id.
+        db.init_schema(self.settings.db_path)
+        with db.connect(self.settings.db_path) as conn:
+            row = conn.execute(
+                "SELECT json_extract(params,'$.video_model') AS m FROM agents "
+                "WHERE project_id=? AND role='video_keyframe_artist'",
+                (project_id,),
+            ).fetchone()
+        self.assertEqual(row["m"], "302ai:wan2.7-i2v",
+                         "init_schema must rename obsolete wan2.2-i2v -> wan2.7-i2v")
+
+    def test_video_model_migration_skips_plus_suffix(self) -> None:
+        """The migration's negative-LIKE clause must NOT touch valid
+        suffixed names (wan2.2-i2v-plus, wan2.2-i2v-flash). They share
+        the substring ``wan2.2-i2v`` with the obsolete bare name but
+        are real models exposed by 302.ai.
+        """
+        info = seed(self.settings)
+        project_id = info["project_id"]
+        for valid_name in ("302ai:wan2.2-i2v-plus", "302ai:wan2.2-i2v-flash"):
+            with db.connect(self.settings.db_path) as conn:
+                conn.execute(
+                    "UPDATE agents SET params = json_set(params, "
+                    "'$.video_model', ?) "
+                    "WHERE project_id=? AND role='video_keyframe_artist'",
+                    (valid_name, project_id),
+                )
+            db.init_schema(self.settings.db_path)
+            with db.connect(self.settings.db_path) as conn:
+                row = conn.execute(
+                    "SELECT json_extract(params,'$.video_model') AS m FROM agents "
+                    "WHERE project_id=? AND role='video_keyframe_artist'",
+                    (project_id,),
+                ).fetchone()
+            self.assertEqual(
+                row["m"], valid_name,
+                f"{valid_name} is a valid 302.ai model, must NOT be renamed",
+            )
+
     # --- 6) topic_validator: batch search query (cost-guard) --------------
 
     def test_topic_validator_batch_search(self) -> None:
@@ -1649,10 +1712,16 @@ class PricingHelpersTest(unittest.TestCase):
 
     def test_estimate_video_cost(self) -> None:
         from aicrew.llm.pricing import estimate_video_cost
-        # Wan 2.2-i2v: $0.12 per 5-second clip.
-        self.assertAlmostEqual(estimate_video_cost("302ai:wan2.2-i2v", 5.0), 0.12, places=6)
-        # 10-second clip = 2x the 5s rate.
-        self.assertAlmostEqual(estimate_video_cost("302ai:wan2.2-i2v", 10.0), 0.24, places=6)
+        # Wan 2.7-i2v 720P: $0.10 per second of generated video.
+        # 302.ai bills i2v linearly per output second (not per 5s clip);
+        # the previous per-5s formula under-counted real spend by 5x.
+        self.assertAlmostEqual(estimate_video_cost("302ai:wan2.7-i2v", 5.0), 0.50, places=6)
+        # 10-second clip = 2x the 5s cost.
+        self.assertAlmostEqual(estimate_video_cost("302ai:wan2.7-i2v", 10.0), 1.00, places=6)
+        # Wan 2.2-i2v-flash is the cheap tier — $0.04/sec at 720P.
+        self.assertAlmostEqual(estimate_video_cost("302ai:wan2.2-i2v-flash", 5.0), 0.20, places=6)
+        # Wan 2.2-i2v-plus is the 1080P tier — $0.15/sec.
+        self.assertAlmostEqual(estimate_video_cost("302ai:wan2.2-i2v-plus", 5.0), 0.75, places=6)
         # Mock = $0.
         self.assertEqual(estimate_video_cost("mock:placeholder", 5.0), 0.0)
         # Negative duration clamps to 0.

@@ -192,8 +192,16 @@ def concat_audio_files(audio_paths: list[str], *, settings: Settings,
     try:
         with open(list_path, "w", encoding="utf-8") as fh:
             for p in paths:
+                # ffmpeg's concat demuxer resolves relative paths against
+                # the LIST FILE location, not cwd. So writing relative
+                # ``media/tts_x.mp3`` while the list itself lives in
+                # ``media/`` produces ``media/media/tts_x.mp3`` -> ENOENT.
+                # Always write absolute paths to dodge that whole class.
+                # (See production bug: Impossible to open
+                # 'media/media/tts_23e886.mp3', concat rc=254.)
+                abs_p = os.path.abspath(p)
                 # Escape single quotes per ffmpeg concat-demuxer rules.
-                escaped = p.replace("'", r"'\''")
+                escaped = abs_p.replace("'", r"'\''")
                 fh.write(f"file '{escaped}'\n")
         cmd = [
             ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
@@ -268,7 +276,7 @@ def _call_ffmpeg_concat(scenes: list[dict], out_path: str,
     for sc in scenes:
         cand = (sc.get("ass_path") or "").strip()
         if cand and os.path.exists(cand):
-            ass_path = cand
+            ass_path = os.path.abspath(cand)
             break
 
     for i, sc in enumerate(scenes):
@@ -279,14 +287,17 @@ def _call_ffmpeg_concat(scenes: list[dict], out_path: str,
             )
         duration = float(sc.get("duration_s") or 5.0)
 
-        inputs += ["-i", clip_path]
+        # Always pass absolute paths to ffmpeg — relative ones get
+        # resolved against an undocumented cwd which differs between
+        # systemd and a manual shell. Same trap as concat_audio_files.
+        inputs += ["-i", os.path.abspath(clip_path)]
         clip_input_idx = len(has_audio_input) * 2 + (
             sum(1 for h in has_audio_input if h)
         )  # not exact — recompute below
 
         audio_path = (sc.get("audio_path") or "").strip()
         if audio_path and os.path.exists(audio_path):
-            inputs += ["-i", audio_path]
+            inputs += ["-i", os.path.abspath(audio_path)]
             has_audio_input.append(True)
         else:
             has_audio_input.append(False)

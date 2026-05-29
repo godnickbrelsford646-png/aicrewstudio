@@ -321,6 +321,25 @@ def init_schema(db_path: str) -> None:
                 "ALTER TABLE media_assets ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0"
             )
 
+        # Soft migration: rename the obsolete video_model
+        # ``"302ai:wan2.2-i2v"`` (which 302.ai never actually exposed —
+        # production calls returned HTTP 503 "No available models
+        # currently") to the new default ``"302ai:wan2.7-i2v"``.
+        # Idempotent: re-running on rows that were already migrated
+        # is a no-op (REPLACE matches nothing). The negative LIKE
+        # protects valid suffixed names like wan2.2-i2v-plus and
+        # wan2.2-i2v-flash from being touched.
+        conn.execute(
+            "UPDATE agents SET "
+            "  params = REPLACE(params, "
+            "    '\"302ai:wan2.2-i2v\"', '\"302ai:wan2.7-i2v\"'), "
+            "  updated_at = ? "
+            "WHERE role='video_keyframe_artist' "
+            "  AND params LIKE '%302ai:wan2.2-i2v%' "
+            "  AND params NOT LIKE '%302ai:wan2.2-i2v-%'",
+            (now_iso(),),
+        )
+
         # Sync ZADNIM-style agents with the latest prompts / params /
         # model config. Idempotent: re-running just re-applies the same
         # values. Used when a release ships new anti-hallucination rules

@@ -2,9 +2,9 @@
 
 Routing by model string (mirrors aicrew/tools/image_gen.py):
   - ``mock:placeholder`` (or empty / "mock") -> placeholder MP4 (no API call).
-  - ``302ai:wan2.2-i2v`` (or any ``302ai:wan*-i2v``) -> ASYNC DashScope path:
+  - ``302ai:wan2.7-i2v`` (or any ``302ai:wan*-i2v``) -> ASYNC DashScope path:
         POST /aliyun/api/v1/services/aigc/video-generation/video-synthesis
-        Body uses input.{prompt, img_url}, parameters.{duration, size}.
+        Body uses input.{prompt, img_url}, parameters.{duration, resolution}.
         Returns task_id; poll /aliyun/api/v1/tasks/{task_id} until SUCCEEDED.
         Result MP4 is downloaded from output.results[0].video_url (or one of
         several alternative shape variants).
@@ -221,14 +221,14 @@ def _call_302ai_wan_i2v(image_url: str, prompt: str, model: str,
         Authorization: Bearer <AI302_API_KEY>
         Content-Type: application/json
         {
-            "model": "wan2.2-i2v",
+            "model": "wan2.7-i2v",
             "input": {
                 "prompt":  <motion description>,
                 "img_url": <absolute https URL of source still>
             },
             "parameters": {
-                "duration": <seconds, integer>,
-                "size":     "1080*1920"   # 9:16 vertical
+                "duration":   <seconds, integer 3..10>,
+                "resolution": "1080P"           # 480P | 720P | 1080P
             }
         }
         -> 200 {"output": {"task_id": "...", "task_status": "PENDING"}, ...}
@@ -240,28 +240,35 @@ def _call_302ai_wan_i2v(image_url: str, prompt: str, model: str,
 
         # 3. Download the video URL bytes.
 
-    Cost: ≈$0.12 per 5s clip at the time of writing.
+    Cost: ≈$0.10 per second at wan2.7-i2v 720P, billed linearly.
     """
     # The model string we get can be either the full namespaced form
-    # ``302ai:wan2.2-i2v`` (when called from the pipeline) or the bare
-    # ``wan2.2-i2v`` (when called directly). 302.ai expects the bare form
-    # in the body.
+    # ``302ai:wan2.7-i2v`` (when called from the pipeline) or the bare
+    # ``wan2.7-i2v`` (when called directly). 302.ai expects the bare form
+    # in the body. Note: bare "wan2.2-i2v" (no suffix) was never a valid
+    # 302.ai identifier and now resolves to wan2.7-i2v via DB migration.
     real_model = model.split(":", 1)[1] if ":" in model else model
     submit_url = AI302_BASE + WAN_I2V_SUBMIT_PATH
     body = {
         "model": real_model,
         "input": {
-            # Wan 2.2-i2v hard-caps the prompt at ~2000 chars; trim
+            # Wan i2v hard-caps the prompt at ~2000 chars; trim
             # defensively so we get a real error code from 302.ai
             # rather than a 400 about prompt length.
             "prompt": prompt[:2000],
             "img_url": image_url,
         },
         "parameters": {
-            # Wan i2v accepts integer seconds; round to be safe.
-            "duration": int(round(duration_s)) or 5,
-            # 9:16 vertical, locked by product decision.
-            "size": "1080*1920",
+            # 302.ai accepts integer seconds in [3, 10]; clamp.
+            "duration": max(3, min(10, int(round(duration_s)) or 5)),
+            # Resolution tier. 302.ai derives aspect ratio from img_url
+            # so we don't pass an explicit size string. The legacy
+            # parameters.size="1080*1920" Wanx 2.1 form is rejected by
+            # the newer wan2.{5,6,7}-i2v endpoints.
+            "resolution": "1080P",
+            # Smart prompt rewrite is on by default in the docs; keep
+            # it explicit so future model bumps don't surprise us.
+            "prompt_extend": True,
         },
     }
     task_id = _wan_submit(submit_url, body, api_key, real_model, prompt)
